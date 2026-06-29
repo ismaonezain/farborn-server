@@ -189,7 +189,7 @@ app.post('/api/sync/state', requireAuth, async (req, res) => {
   }
 });
 
-// ─── Sync: Batch Events (Validated) ────────────────────────
+// ─── Sync: Batch Events (Simple & Working) ──────────────────
 app.post('/api/sync/events', requireAuth, async (req, res) => {
   try {
     const { events } = req.body;
@@ -205,141 +205,179 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
     // Parse JSON fields
     let bag = typeof player.bag === 'string' ? JSON.parse(player.bag) : (player.bag || []);
     let equipped = typeof player.equipped === 'string' ? JSON.parse(player.equipped) : (player.equipped || {});
+    let gold = player.gold || 0;
+    let level = player.level || 1;
+    let exp = player.exp || 0;
+    let zone = player.zone || 1;
+    let totalKills = player.totalKills || 0;
+    let zoneKills = player.zoneKills || 0;
     
-    // Create player copy with parsed bag/equipped for validation
-    const playerCopy = { ...player, bag, equipped };
-    
-    // Process each event with validation
+    // Process each event
     for (const event of events) {
       try {
-        const { type, data, ts } = event;
+        const { type, data } = event;
         let valid = false;
         let reason = '';
         
         switch (type) {
           case 'item_drop': {
-            // Validate: check monster level vs player level
-            const validation = validateItemDrop(playerCopy, data.monsterLevel || player.level);
-            if (!validation.valid) {
-              reason = validation.reason;
+            // Simple validation: monster level within 10 of player
+            const monsterLevel = data.monsterLevel || level;
+            if (Math.abs(level - monsterLevel) > 10) {
+              reason = 'Monster level too far from player level';
               break;
             }
             
-            // Generate loot server-side
-            const item = data.item || generateLoot(player.level, player.class);
-            const applyResult = applyItemDrop(player, item);
-            bag = applyResult.bag;
+            // Add item to bag
+            const item = data.item;
+            if (!item || !item.id) {
+              reason = 'Invalid item data';
+              break;
+            }
+            
+            bag.push(item);
             valid = true;
             break;
           }
           
           case 'item_equip': {
-            const validation = validateEquip(playerCopy, data.itemId);
-            if (!validation.valid) {
-              reason = validation.reason;
+            const { itemId } = data;
+            const bagIndex = bag.findIndex(i => i.id === itemId);
+            
+            if (bagIndex === -1) {
+              reason = 'Item not found in bag';
               break;
             }
             
-            const applyResult = applyEquip(player, data.itemId, bag, equipped);
-            bag = applyResult.bag;
-            equipped = applyResult.equipped;
+            const item = bag[bagIndex];
+            const slot = item.type || 'accessory';
+            
+            // Unequip current if exists
+            if (equipped[slot]) {
+              bag.push(equipped[slot]);
+            }
+            
+            // Equip new item
+            equipped[slot] = item;
+            bag.splice(bagIndex, 1);
             valid = true;
             break;
           }
           
           case 'item_unequip': {
-            const validation = validateUnequip(playerCopy, data.itemId);
-            if (!validation.valid) {
-              reason = validation.reason;
-              break;
+            const { itemId } = data;
+            let found = false;
+            
+            for (const [slot, item] of Object.entries(equipped)) {
+              if (item && item.id === itemId) {
+                bag.push(item);
+                equipped[slot] = null;
+                found = true;
+                break;
+              }
             }
             
-            const applyResult = applyUnequip(player, data.itemId, bag, equipped);
-            bag = applyResult.bag;
-            equipped = applyResult.equipped;
+            if (!found) {
+              reason = 'Item not found in equipment';
+              break;
+            }
             valid = true;
             break;
           }
           
           case 'item_sell': {
-            const validation = validateSell(playerCopy, data.itemId);
-            if (!validation.valid) {
-              reason = validation.reason;
+            const { itemId } = data;
+            const bagIndex = bag.findIndex(i => i.id === itemId);
+            
+            if (bagIndex === -1) {
+              reason = 'Item not found in bag';
               break;
             }
             
-            const item = bag.find(i => i.id === data.itemId);
-            const sellPrice = calculateSellPrice(item);
-            const applyResult = applySell(player, data.itemId, bag, sellPrice);
-            bag = applyResult.bag;
-            player.gold = (player.gold || 0) + sellPrice;
+            const item = bag[bagIndex];
+            const sellPrice = Math.floor((item.atk || 0) + (item.def || 0) + (item.hp || 0) + 10);
+            gold += sellPrice;
+            bag.splice(bagIndex, 1);
             valid = true;
             break;
           }
           
           case 'forge_upgrade': {
-            const validation = validateForge(playerCopy, data.itemId);
-            if (!validation.valid) {
-              reason = validation.reason;
+            const { itemId } = data;
+            const bagIndex = bag.findIndex(i => i.id === itemId);
+            
+            if (bagIndex === -1) {
+              reason = 'Item not found in bag';
               break;
             }
             
-            const applyResult = applyForge(player, data.itemId, bag, equipped);
-            bag = applyResult.bag;
-            equipped = applyResult.equipped;
-            player.gold = (player.gold || 0) - (applyResult.goldSpent || 0);
+            const item = bag[bagIndex];
+            const forgeCost = 1000 * ((item.upgradeLevel || 0) + 1);
+            
+            if (gold < forgeCost) {
+              reason = 'Insufficient gold';
+              break;
+            }
+            
+            // Simple forge: 70% success, upgrade +1
+            gold -= forgeCost;
+            if (Math.random() < 0.7) {
+              item.upgradeLevel = (item.upgradeLevel || 0) + 1;
+              item.atk = Math.floor((item.atk || 0) * 1.1);
+              item.def = Math.floor((item.def || 0) * 1.1);
+            }
+            // 30% fail - item stays same
             valid = true;
             break;
           }
           
           case 'level_up': {
-            const newLevel = (player.level || 1) + 1;
-            const validation = validateLevelUp(playerCopy, newLevel);
-            if (!validation.valid) {
-              reason = validation.reason;
+            const expRequired = Math.floor(100 * Math.pow(level, 1.5));
+            if (exp < expRequired) {
+              reason = 'Insufficient EXP';
               break;
             }
             
-            const applyResult = applyLevelUp(player);
-            Object.assign(player, applyResult);
+            exp -= expRequired;
+            level += 1;
             valid = true;
             break;
           }
           
           case 'zone_change': {
-            const validation = validateZoneChange(playerCopy, data.zone);
-            if (!validation.valid) {
-              reason = validation.reason;
+            const { zone: newZone } = data;
+            const requiredLevel = (newZone - 1) * 10 + 1;
+            
+            if (level < requiredLevel) {
+              reason = 'Level too low for this zone';
               break;
             }
             
-            const applyResult = applyZoneChange(player, data.zone);
-            Object.assign(player, applyResult);
+            zone = newZone;
+            zoneKills = 0;
             valid = true;
             break;
           }
           
           case 'gold_spend': {
-            const validation = validateGoldSpend(playerCopy, data.amount);
-            if (!validation.valid) {
-              reason = validation.reason;
+            const { amount } = data;
+            if (gold < amount) {
+              reason = 'Insufficient gold';
               break;
             }
-            
-            const applyResult = applyGoldSpend(player, data.amount);
-            Object.assign(player, applyResult);
+            gold -= amount;
             valid = true;
             break;
           }
           
+          case 'kill':
           case 'stat_upgrade':
           case 'skill_use':
           case 'prestige':
           case 'full_state':
-            // These are handled by full state sync
             valid = true;
             break;
-          
+            
           default:
             reason = 'Unknown event type';
         }
@@ -350,7 +388,7 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           rejected.push({ id: event.id, type, reason });
         }
       } catch (err) {
-        console.error(`Failed to process event ${event.id}:`, err);
+        console.error('Event processing error:', err);
         rejected.push({ id: event.id, type: event.type, reason: err.message });
       }
     }
@@ -358,14 +396,14 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
     // Save updated state
     if (synced.length > 0) {
       await updatePlayer(req.fid, {
-        level: player.level,
-        exp: player.exp,
-        gold: player.gold,
-        zone: player.zone,
+        level,
+        exp,
+        gold,
+        zone,
         equipped: JSON.stringify(equipped),
         bag: JSON.stringify(bag),
-        totalKills: player.totalKills,
-        zoneKills: player.zoneKills
+        totalKills,
+        zoneKills
       });
     }
     
