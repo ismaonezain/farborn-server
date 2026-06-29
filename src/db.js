@@ -68,7 +68,7 @@ const alterStatements = [
   "ALTER TABLE players ADD COLUMN zoneKills INTEGER DEFAULT 0",
   "ALTER TABLE players ADD COLUMN prestige INTEGER DEFAULT 0",
   "ALTER TABLE players ADD COLUMN prestigeMult REAL DEFAULT 1.0",
-  "ALTER TABLE players ADD COLUMN last_online TEXT DEFAULT (datetime('now'))",
+  "ALTER TABLE players ADD COLUMN last_online TEXT DEFAULT NULL",
 ];
 
 for (const stmt of alterStatements) {
