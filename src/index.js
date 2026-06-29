@@ -206,6 +206,9 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
     let bag = typeof player.bag === 'string' ? JSON.parse(player.bag) : (player.bag || []);
     let equipped = typeof player.equipped === 'string' ? JSON.parse(player.equipped) : (player.equipped || {});
     
+    // Create player copy with parsed bag/equipped for validation
+    const playerCopy = { ...player, bag, equipped };
+    
     // Process each event with validation
     for (const event of events) {
       try {
@@ -216,7 +219,7 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
         switch (type) {
           case 'item_drop': {
             // Validate: check monster level vs player level
-            const validation = validateItemDrop(player, data.monsterLevel || player.level);
+            const validation = validateItemDrop(playerCopy, data.monsterLevel || player.level);
             if (!validation.valid) {
               reason = validation.reason;
               break;
@@ -231,7 +234,7 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           }
           
           case 'item_equip': {
-            const validation = validateEquip(player, data.itemId);
+            const validation = validateEquip(playerCopy, data.itemId);
             if (!validation.valid) {
               reason = validation.reason;
               break;
@@ -245,7 +248,7 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           }
           
           case 'item_unequip': {
-            const validation = validateUnequip(player, data.itemId);
+            const validation = validateUnequip(playerCopy, data.itemId);
             if (!validation.valid) {
               reason = validation.reason;
               break;
@@ -259,7 +262,7 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           }
           
           case 'item_sell': {
-            const validation = validateSell(player, data.itemId);
+            const validation = validateSell(playerCopy, data.itemId);
             if (!validation.valid) {
               reason = validation.reason;
               break;
@@ -275,7 +278,7 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           }
           
           case 'forge_upgrade': {
-            const validation = validateForge(player, data.itemId);
+            const validation = validateForge(playerCopy, data.itemId);
             if (!validation.valid) {
               reason = validation.reason;
               break;
@@ -291,7 +294,7 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           
           case 'level_up': {
             const newLevel = (player.level || 1) + 1;
-            const validation = validateLevelUp(player, newLevel);
+            const validation = validateLevelUp(playerCopy, newLevel);
             if (!validation.valid) {
               reason = validation.reason;
               break;
@@ -304,7 +307,7 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           }
           
           case 'zone_change': {
-            const validation = validateZoneChange(player, data.zone);
+            const validation = validateZoneChange(playerCopy, data.zone);
             if (!validation.valid) {
               reason = validation.reason;
               break;
@@ -317,7 +320,7 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           }
           
           case 'gold_spend': {
-            const validation = validateGoldSpend(player, data.amount);
+            const validation = validateGoldSpend(playerCopy, data.amount);
             if (!validation.valid) {
               reason = validation.reason;
               break;
