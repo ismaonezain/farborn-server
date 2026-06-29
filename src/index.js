@@ -410,9 +410,15 @@ app.get('/api/offline/progress', requireAuth, async (req, res) => {
     const player = await getPlayer(req.fid);
     if (!player) return res.status(404).json({ error: 'Player not found' });
     
-    // Get last_online from DB
-    const row = await getOne('SELECT last_online FROM players WHERE fid = ?', [req.fid]);
-    const lastOnline = row?.last_online || null;
+    // Get last_online from DB (handle missing column gracefully)
+    let lastOnline = null;
+    try {
+      const row = await getOne('SELECT last_online FROM players WHERE fid = ?', [req.fid]);
+      lastOnline = row?.last_online || null;
+    } catch (e) {
+      // Column may not exist yet — offline progress returns 0
+      lastOnline = null;
+    }
     
     // Calculate offline progress
     const progress = calculateOfflineProgress(player, lastOnline);
