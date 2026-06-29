@@ -15,6 +15,7 @@ const schema = [
     exp INTEGER DEFAULT 0, upg TEXT DEFAULT '{}', skillIdx INTEGER DEFAULT 0,
     totalKills INTEGER DEFAULT 0, zoneKills INTEGER DEFAULT 0,
     prestige INTEGER DEFAULT 0, prestigeMult REAL DEFAULT 1.0,
+    last_online TEXT DEFAULT (datetime('now')),
     created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
   )`,
   `CREATE TABLE IF NOT EXISTS gold_claims (
@@ -67,6 +68,7 @@ const alterStatements = [
   "ALTER TABLE players ADD COLUMN zoneKills INTEGER DEFAULT 0",
   "ALTER TABLE players ADD COLUMN prestige INTEGER DEFAULT 0",
   "ALTER TABLE players ADD COLUMN prestigeMult REAL DEFAULT 1.0",
+  "ALTER TABLE players ADD COLUMN last_online TEXT DEFAULT (datetime('now'))",
 ];
 
 for (const stmt of alterStatements) {

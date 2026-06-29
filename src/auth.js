@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { getOne, getAll, run } from './db.js';
+import { getOne, run } from './db.js';
 
 export async function generateLoginToken(fid, username, wallet) {
   const token = crypto.randomBytes(32).toString('hex');
@@ -27,7 +27,10 @@ export function requireAuth(req, res, next) {
   verifyLoginToken(token).then(session => {
     if (!session) return res.status(401).json({ error: 'Invalid or expired token' });
     req.fid = session.fid;
-    next();
+    // Update last_online timestamp on every authenticated request
+    run("UPDATE players SET last_online = datetime('now') WHERE fid = ?", [session.fid])
+      .then(() => next())
+      .catch(() => next()); // Don't fail request if timestamp update fails
   }).catch(() => res.status(500).json({ error: 'Auth error' }));
 }
 

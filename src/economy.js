@@ -191,9 +191,11 @@ async function processGoldClaim(fid, goldAmount, dynamicPrice) {
 async function updatePlayer(fid, data) {
   const fields = [], values = [];
   for (const [key, value] of Object.entries(data)) {
-    if (['level', 'class', 'zone', 'gold', 'equipped', 'bag'].includes(key)) {
+    if (['level', 'class', 'zone', 'gold', 'equipped', 'bag', 'exp',
+         'totalKills', 'zoneKills', 'upg', 'skillIdx', 'prestige',
+         'prestigeMult', 'total_gold_earned', 'last_online'].includes(key)) {
       fields.push(key + ' = ?');
-      values.push(key === 'equipped' || key === 'bag' ? JSON.stringify(value) : value);
+      values.push(['equipped', 'bag', 'upg'].includes(key) ? JSON.stringify(value) : value);
     }
   }
   if (fields.length === 0) return false;

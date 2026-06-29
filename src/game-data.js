@@ -43,6 +43,24 @@ export const CLASS_STATS = {
     baseDEF: 25,
     baseSPD: 8,
     baseMP: 80
+  },
+  ranger: {
+    name: 'Ranger',
+    description: 'A swift marksman with balanced stats and high speed.',
+    baseHP: 95,
+    baseATK: 18,
+    baseDEF: 8,
+    baseSPD: 1.2,
+    baseMP: 80
+  },
+  necromancer: {
+    name: 'Necromancer',
+    description: 'A dark spellcaster with high attack and mana but fragile defenses.',
+    baseHP: 85,
+    baseATK: 22,
+    baseDEF: 6,
+    baseSPD: 0.9,
+    baseMP: 100
   }
 };
 
@@ -91,6 +109,20 @@ export const STAT_GROWTH = {
     DEF: 2.5,
     SPD: 0.3,
     MP: 8
+  },
+  ranger: {
+    HP: 8,
+    ATK: 3.0,
+    DEF: 1.5,
+    SPD: 2.0,
+    MP: 8
+  },
+  necromancer: {
+    HP: 7,
+    ATK: 4.5,
+    DEF: 0.8,
+    SPD: 0.8,
+    MP: 12
   }
 };
 
@@ -135,7 +167,7 @@ export const RARITY_TABLE = {
     color: '#e6cc80',
     glow: true
   },
-  Divine: {
+  Immortal: {
     multiplier: 11.0,
     dropRate: 0.001,
     color: '#ff0000',
@@ -2107,6 +2139,25 @@ export function calculateItemStats(item, rarity, upgradeLevel = 0) {
   
   return stats;
 }
+
+// ============================================================
+// ADDITIONAL CONSTANTS
+// ============================================================
+
+export const RARITY_NAMES = {
+  Common: 'Common',
+  Uncommon: 'Uncommon',
+  Rare: 'Rare',
+  Epic: 'Epic',
+  Legendary: 'Legendary',
+  Mythic: 'Mythic',
+  Immortal: 'Immortal',
+  Archgod: 'Archgod'
+};
+
+export const BAG_SIZE = 96;
+
+export const COMBAT_TICK_MS = 5000;
 
 // Export all data
 export default {

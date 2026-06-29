@@ -15,8 +15,10 @@ import {
   validateSell, validateForge, validateZoneChange, validateGoldSpend,
   applyLevelUp, applyItemDrop, applyEquip, applyUnequip,
   applySell, applyForge, applyZoneChange, applyGoldSpend,
-  generateLoot, calculateSellPrice, calculateForgeCost
+  calculateSellPrice, calculateForgeCost,
+  processCombatTick, calculateOfflineProgress, dbPlayerToGame
 } from './game-logic.js';
+import { ZONE_DATA, MONSTER_DATA } from './game-data.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -64,7 +66,7 @@ app.post('/api/auth/login', async (req, res) => {
     const walletOwner = await getOne('SELECT fid FROM players WHERE wallet = ?', [walletLower]);
     if (walletOwner && walletOwner.fid !== fid) {
       return res.status(409).json({ 
-        error: 'Wallet already linked to another account',
+        error: 'Wallet already linked to another account', 
         linkedFid: walletOwner.fid 
       });
     }
@@ -73,7 +75,7 @@ app.post('/api/auth/login', async (req, res) => {
     const usernameOwner = await getOne('SELECT fid FROM players WHERE username = ? AND fid != ?', [username, fid]);
     if (usernameOwner) {
       return res.status(409).json({ 
-        error: 'Username already taken',
+        error: 'Username already taken', 
         ownerFid: usernameOwner.fid 
       });
     }
@@ -91,7 +93,6 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({ token, expiresAt, player });
   } catch (err) {
     console.error('Login error:', err);
-    // Handle unique constraint violations
     if (err.message?.includes('UNIQUE constraint failed')) {
       if (err.message.includes('wallet')) {
         return res.status(409).json({ error: 'Wallet already linked to another account' });
@@ -147,6 +148,9 @@ app.post('/api/sync/state', requireAuth, async (req, res) => {
     // Gold: take higher (both could earn offline)
     if (gold !== undefined && gold > (current.gold || 0)) updates.gold = gold;
     
+    // EXP: take higher
+    if (exp !== undefined && exp > (current.exp || 0)) updates.exp = exp;
+    
     // Equipped: server is source of truth (already synced via events)
     if (equipped) updates.equipped = equipped;
     
@@ -163,7 +167,7 @@ app.post('/api/sync/state', requireAuth, async (req, res) => {
     if (heroClass) updates.class = heroClass;
     
     // Upgrades
-    if (upg) updates.upg = JSON.stringify(upg);
+    if (upg) updates.upg = upg;
     
     // Skill
     if (skillIdx !== undefined) updates.skillIdx = skillIdx;
@@ -189,7 +193,7 @@ app.post('/api/sync/state', requireAuth, async (req, res) => {
   }
 });
 
-// ─── Sync: Batch Events (Simple & Working) ──────────────────
+// ─── Sync: Batch Events (Server-Authoritative) ───────────────
 app.post('/api/sync/events', requireAuth, async (req, res) => {
   try {
     const { events } = req.body;
@@ -202,157 +206,103 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
     const player = await getPlayer(req.fid);
     if (!player) return res.status(404).json({ error: 'Player not found' });
     
-    // Parse JSON fields
-    let bag = typeof player.bag === 'string' ? JSON.parse(player.bag) : (player.bag || []);
-    let equipped = typeof player.equipped === 'string' ? JSON.parse(player.equipped) : (player.equipped || {});
-    let gold = player.gold || 0;
-    let level = player.level || 1;
-    let exp = player.exp || 0;
-    let zone = player.zone || 1;
-    let totalKills = player.totalKills || 0;
-    let zoneKills = player.zoneKills || 0;
+    // Convert to game-logic format for processing
+    const gamePlayer = dbPlayerToGame(player);
+    let bag = [...gamePlayer.bag];
+    let equipped = { ...gamePlayer.equipped };
+    let gold = gamePlayer.gold;
+    let level = gamePlayer.level;
+    let exp = gamePlayer.exp;
+    let zone = gamePlayer.zone;
+    let totalKills = gamePlayer.totalKills;
+    let zoneKills = gamePlayer.zoneKills;
     
-    // Process each event
+    // Process each event using game-logic validation/apply functions
     for (const event of events) {
       try {
         const { type, data } = event;
         let valid = false;
         let reason = '';
         
+        // Build a temporary player state for validation
+        const tempPlayer = {
+          level, exp, gold, zone, class: player.class,
+          bag, equipped, totalKills, zoneKills,
+          maxHp: 100, hp: 100, maxMp: 50, mp: 50,
+          stats: {}, materials: {}
+        };
+        
         switch (type) {
           case 'item_drop': {
-            // Simple validation: monster level within 10 of player
             const monsterLevel = data.monsterLevel || level;
-            if (Math.abs(level - monsterLevel) > 10) {
-              reason = 'Monster level too far from player level';
-              break;
-            }
-            
-            // Add item to bag
-            const item = data.item;
-            if (!item || !item.id) {
-              reason = 'Invalid item data';
-              break;
-            }
-            
-            bag.push(item);
+            const dropResult = validateItemDrop(tempPlayer, monsterLevel);
+            if (!dropResult.valid) { reason = dropResult.reason; break; }
+            if (!data.item || !data.item.id) { reason = 'Invalid item data'; break; }
+            const addResult = applyItemDrop(tempPlayer, data.item);
+            bag = addResult.bag;
             valid = true;
             break;
           }
           
           case 'item_equip': {
             const { itemId } = data;
-            const bagIndex = bag.findIndex(i => i.id === itemId);
-            
-            if (bagIndex === -1) {
-              reason = 'Item not found in bag';
-              break;
-            }
-            
-            const item = bag[bagIndex];
-            const slot = item.type || 'accessory';
-            
-            // Unequip current if exists
-            if (equipped[slot]) {
-              bag.push(equipped[slot]);
-            }
-            
-            // Equip new item
-            equipped[slot] = item;
-            bag.splice(bagIndex, 1);
+            const equipResult = validateEquip(tempPlayer, itemId);
+            if (!equipResult.valid) { reason = equipResult.reason; break; }
+            const applied = applyEquip(tempPlayer, itemId);
+            bag = applied.bag;
+            equipped = applied.equipped;
             valid = true;
             break;
           }
           
           case 'item_unequip': {
             const { itemId } = data;
-            let found = false;
-            
-            for (const [slot, item] of Object.entries(equipped)) {
-              if (item && item.id === itemId) {
-                bag.push(item);
-                equipped[slot] = null;
-                found = true;
-                break;
-              }
-            }
-            
-            if (!found) {
-              reason = 'Item not found in equipment';
-              break;
-            }
+            const unequipResult = validateUnequip(tempPlayer, itemId);
+            if (!unequipResult.valid) { reason = unequipResult.reason; break; }
+            const applied = applyUnequip(tempPlayer, itemId);
+            bag = applied.bag;
+            equipped = applied.equipped;
             valid = true;
             break;
           }
           
           case 'item_sell': {
             const { itemId } = data;
-            const bagIndex = bag.findIndex(i => i.id === itemId);
-            
-            if (bagIndex === -1) {
-              reason = 'Item not found in bag';
-              break;
-            }
-            
-            const item = bag[bagIndex];
-            const sellPrice = Math.floor((item.atk || 0) + (item.def || 0) + (item.hp || 0) + 10);
-            gold += sellPrice;
-            bag.splice(bagIndex, 1);
+            const sellResult = validateSell(tempPlayer, itemId);
+            if (!sellResult.valid) { reason = sellResult.reason; break; }
+            const applied = applySell(tempPlayer, itemId);
+            bag = applied.bag;
+            gold = applied.gold;
             valid = true;
             break;
           }
           
           case 'forge_upgrade': {
             const { itemId } = data;
-            const bagIndex = bag.findIndex(i => i.id === itemId);
-            
-            if (bagIndex === -1) {
-              reason = 'Item not found in bag';
-              break;
-            }
-            
-            const item = bag[bagIndex];
-            const forgeCost = 1000 * ((item.upgradeLevel || 0) + 1);
-            
-            if (gold < forgeCost) {
-              reason = 'Insufficient gold';
-              break;
-            }
-            
-            // Simple forge: 70% success, upgrade +1
-            gold -= forgeCost;
-            if (Math.random() < 0.7) {
-              item.upgradeLevel = (item.upgradeLevel || 0) + 1;
-              item.atk = Math.floor((item.atk || 0) * 1.1);
-              item.def = Math.floor((item.def || 0) * 1.1);
-            }
-            // 30% fail - item stays same
+            const forgeResult = validateForge(tempPlayer, itemId);
+            if (!forgeResult.valid) { reason = forgeResult.reason; break; }
+            const applied = applyForge(tempPlayer, itemId);
+            bag = applied.bag;
+            equipped = applied.equipped;
+            gold = applied.gold;
             valid = true;
             break;
           }
           
           case 'level_up': {
-            const expRequired = Math.floor(100 * Math.pow(level, 1.5));
-            if (exp < expRequired) {
-              reason = 'Insufficient EXP';
-              break;
-            }
-            
-            exp -= expRequired;
-            level += 1;
+            const levelResult = validateLevelUp(tempPlayer, level + 1);
+            if (!levelResult.valid) { reason = levelResult.reason; break; }
+            const applied = applyLevelUp({ ...tempPlayer, level, exp });
+            level = applied.level;
+            exp = applied.exp;
             valid = true;
             break;
           }
           
           case 'zone_change': {
-            const { zone: newZone } = data;
-            const requiredLevel = (newZone - 1) * 10 + 1;
-            
-            if (level < requiredLevel) {
-              reason = 'Level too low for this zone';
-              break;
-            }
-            
+            const newZone = data.zone || data.newZone;
+            const zoneResult = validateZoneChange(tempPlayer, newZone);
+            if (!zoneResult.valid) { reason = zoneResult.reason; break; }
             zone = newZone;
             zoneKills = 0;
             valid = true;
@@ -361,11 +311,9 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           
           case 'gold_spend': {
             const { amount } = data;
-            if (gold < amount) {
-              reason = 'Insufficient gold';
-              break;
-            }
-            gold -= amount;
+            const goldResult = validateGoldSpend(tempPlayer, amount);
+            if (!goldResult.valid) { reason = goldResult.reason; break; }
+            gold = tempPlayer.gold - amount;
             valid = true;
             break;
           }
@@ -400,8 +348,8 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
         exp,
         gold,
         zone,
-        equipped: JSON.stringify(equipped),
-        bag: JSON.stringify(bag),
+        equipped,
+        bag,
         totalKills,
         zoneKills
       });
@@ -411,6 +359,85 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('Sync events error:', err);
     res.status(500).json({ error: 'Sync failed' });
+  }
+});
+
+// ─── Combat Tick (Server-Authoritative) ──────────────────
+app.post('/api/combat/tick', requireAuth, async (req, res) => {
+  try {
+    const player = await getPlayer(req.fid);
+    if (!player) return res.status(404).json({ error: 'Player not found' });
+    
+    const zone = player.zone || 1;
+    const zoneData = ZONE_DATA[zone];
+    if (!zoneData) return res.status(400).json({ error: 'Invalid zone' });
+    
+    // Run server-authoritative combat
+    const result = processCombatTick(player, zone, zoneData.monsters);
+    
+    // Update player state in DB
+    const updates = {
+      level: result.newStats.level,
+      exp: result.newStats.exp,
+      gold: result.newStats.gold,
+      totalKills: result.newStats.totalKills,
+      zoneKills: result.newStats.zoneKills,
+      bag: result.newStats.bag
+    };
+    
+    await updatePlayer(req.fid, updates);
+    
+    // Get updated player for response
+    const updatedPlayer = await getPlayer(req.fid);
+    
+    res.json({
+      attacks: result.attacks,
+      expGained: result.expGained,
+      goldGained: result.goldGained,
+      itemsDropped: result.itemsDropped,
+      levelUps: result.levelUps,
+      player: updatedPlayer
+    });
+  } catch (err) {
+    console.error('Combat tick error:', err);
+    res.status(500).json({ error: 'Combat tick failed' });
+  }
+});
+
+// ─── Offline Progress ────────────────────────────────────
+app.get('/api/offline/progress', requireAuth, async (req, res) => {
+  try {
+    const player = await getPlayer(req.fid);
+    if (!player) return res.status(404).json({ error: 'Player not found' });
+    
+    // Get last_online from DB
+    const row = await getOne('SELECT last_online FROM players WHERE fid = ?', [req.fid]);
+    const lastOnline = row?.last_online || null;
+    
+    // Calculate offline progress
+    const progress = calculateOfflineProgress(player, lastOnline);
+    
+    if (progress.duration === 0) {
+      return res.json({ duration: 0, expGained: 0, goldGained: 0, player });
+    }
+    
+    // Apply gains
+    const newExp = (player.exp || 0) + progress.expGained;
+    const newGold = (player.gold || 0) + progress.goldGained;
+    
+    await updatePlayer(req.fid, { exp: newExp, gold: newGold });
+    
+    const updatedPlayer = await getPlayer(req.fid);
+    
+    res.json({
+      duration: progress.duration,
+      expGained: progress.expGained,
+      goldGained: progress.goldGained,
+      player: updatedPlayer
+    });
+  } catch (err) {
+    console.error('Offline progress error:', err);
+    res.status(500).json({ error: 'Failed to calculate offline progress' });
   }
 });
 
@@ -530,10 +557,9 @@ app.get('/api/leaderboard/:type', async (req, res) => {
     }
 
     if (type === 'power') {
-      // Power = level * 100 + equipped item stats
       const rows = await getAll(
         'SELECT fid, username, hero_name, class, level, gold, equipped FROM players ORDER BY level DESC LIMIT ?',
-        [limit * 3] // fetch more to sort by power
+        [limit * 3]
       );
       const ranked = rows.map(r => {
         let eqPower = 0;

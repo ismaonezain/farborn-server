@@ -1,464 +1,329 @@
 // =============================================================================
-// FARBORN SERVER - GAME LOGIC & VALIDATION SYSTEM
-// Comprehensive server-side game state validation and logic
+// FARBORN SERVER - GAME LOGIC & VALIDATION SYSTEM (Server-Authoritative)
 // =============================================================================
 
+import {
+  CLASS_STATS, STAT_GROWTH, LEVEL_TABLE, RARITY_TABLE, MONSTER_DATA,
+  ZONE_DATA, FORGE_DATA, BAG_SIZE, COMBAT_TICK_MS, getRandomRarity
+} from './game-data.js';
+
 // =============================================================================
-// 1. GAME CONSTANTS (Balance Values)
+// 1. PLAYER MODEL CONVERSION (DB ↔ Game-Logic)
 // =============================================================================
 
 /**
- * Experience required per level
- * Formula: base * (level ^ exponent) + flat_bonus
+ * Convert DB player row to game-logic player object with computed combat stats
  */
-const EXP_PER_LEVEL = {
-  base: 100,
-  exponent: 1.5,
-  flatBonus: 50
-};
+export function dbPlayerToGame(dbPlayer) {
+  const equipped = typeof dbPlayer.equipped === 'string'
+    ? JSON.parse(dbPlayer.equipped || '{}')
+    : (dbPlayer.equipped || {});
+  const bag = typeof dbPlayer.bag === 'string'
+    ? JSON.parse(dbPlayer.bag || '[]')
+    : (dbPlayer.bag || []);
+  const upg = typeof dbPlayer.upg === 'string'
+    ? JSON.parse(dbPlayer.upg || '{}')
+    : (dbPlayer.upg || {});
 
-/**
- * Calculate EXP required for a specific level
- */
-function getExpRequiredForLevel(level) {
-  return Math.floor(
-    EXP_PER_LEVEL.base * Math.pow(level, EXP_PER_LEVEL.exponent) + EXP_PER_LEVEL.flatBonus
-  );
+  const classStats = CLASS_STATS[dbPlayer.class] || CLASS_STATS.warrior;
+  const growth = STAT_GROWTH[dbPlayer.class] || STAT_GROWTH.warrior;
+  const level = dbPlayer.level || 1;
+
+  // Compute base stats from class + level
+  let atk = classStats.baseATK + growth.ATK * (level - 1);
+  let def = classStats.baseDEF + growth.DEF * (level - 1);
+  let hp = classStats.baseHP + growth.HP * (level - 1);
+  let mp = classStats.baseMP + growth.MP * (level - 1);
+  let spd = classStats.baseSPD + growth.SPD * (level - 1);
+
+  // Add equipment bonuses
+  for (const item of Object.values(equipped)) {
+    if (item && typeof item === 'object') {
+      atk += (item.atk || item.stats?.attack || 0);
+      def += (item.def || item.stats?.defense || 0);
+      hp += (item.hp || item.stats?.hp || 0);
+    }
+  }
+
+  return {
+    fid: dbPlayer.fid,
+    level,
+    class: dbPlayer.class,
+    exp: dbPlayer.exp || 0,
+    gold: dbPlayer.gold || 0,
+    zone: dbPlayer.zone || 1,
+    equipped,
+    bag,
+    upg,
+    skillIdx: dbPlayer.skillIdx || 0,
+    totalKills: dbPlayer.totalKills || 0,
+    zoneKills: dbPlayer.zoneKills || 0,
+    prestige: dbPlayer.prestige || 0,
+    prestigeMult: dbPlayer.prestigeMult || 1.0,
+    // Computed combat stats
+    atk: Math.floor(atk),
+    def: Math.floor(def),
+    maxHp: Math.floor(hp),
+    hp: Math.floor(hp),
+    maxMp: Math.floor(mp),
+    mp: Math.floor(mp),
+    spd: Math.floor(spd),
+  };
 }
 
-/**
- * Stat growth per level for each class
- * Format: { strength: base, agility: base, intelligence: base, vitality: base }
- */
-const STAT_GROWTH_PER_LEVEL = {
-  warrior: {
-    strength: 3,
-    agility: 1,
-    intelligence: 0.5,
-    vitality: 2
-  },
-  mage: {
-    strength: 0.5,
-    agility: 1,
-    intelligence: 3,
-    vitality: 1.5
-  },
-  rogue: {
-    strength: 1.5,
-    agility: 3,
-    intelligence: 1,
-    vitality: 1.5
-  },
-  paladin: {
-    strength: 2,
-    agility: 0.5,
-    intelligence: 1,
-    vitality: 3
-  }
-};
+// =============================================================================
+// 2. EXP TABLE
+// =============================================================================
 
 /**
- * Item rarity drop chances (must sum to 1.0)
+ * Get EXP required for a specific level (uses LEVEL_TABLE from game-data.js)
  */
-const RARITY_CHANCES = {
-  common: 0.50,      // 50%
-  uncommon: 0.30,    // 30%
-  rare: 0.15,        // 15%
-  epic: 0.04,        // 4%
-  legendary: 0.01    // 1%
-};
-
-/**
- * Forge success rates by item rarity
- */
-const FORGE_SUCCESS_RATES = {
-  common: 1.00,      // 100% - guaranteed upgrade
-  uncommon: 0.90,    // 90%
-  rare: 0.75,        // 75%
-  epic: 0.50,        // 50%
-  legendary: 0.30    // 30%
-};
-
-/**
- * Zone unlock requirements (level required to access)
- */
-const ZONE_UNLOCK_REQUIREMENTS = {
-  'plains': 1,
-  'forest': 5,
-  'caves': 10,
-  'swamp': 15,
-  'mountains': 20,
-  'volcano': 25,
-  'frozen_peak': 30,
-  'ancient_ruins': 35,
-  'demon_realm': 40,
-  'void': 50
-};
+export function getExpRequiredForLevel(level) {
+  if (LEVEL_TABLE[level] !== undefined) return LEVEL_TABLE[level];
+  return Math.floor(100 * Math.pow(level, 1.5));
+}
 
 // =============================================================================
-// 2. VALIDATION FUNCTIONS
+// 3. VALIDATION FUNCTIONS
 // =============================================================================
 
 /**
  * Validate item drop from monster
- * @param {Object} player - Player state
- * @param {number} monsterLevel - Level of defeated monster
- * @returns {Object} { valid: boolean, reason: string }
  */
-function validateItemDrop(player, monsterLevel) {
+export function validateItemDrop(player, monsterLevel) {
   if (!player || typeof monsterLevel !== 'number') {
     return { valid: false, reason: 'Invalid player or monster level' };
   }
-
-  // Check if player is within level range of monster (within 10 levels)
   const levelDiff = Math.abs(player.level - monsterLevel);
   if (levelDiff > 10) {
     return { valid: false, reason: 'Player level too far from monster level (max 10 difference)' };
   }
-
-  // Check if monster level is reasonable
   if (monsterLevel < 1 || monsterLevel > 100) {
     return { valid: false, reason: 'Monster level out of valid range (1-100)' };
   }
-
   return { valid: true, reason: 'Item drop valid' };
 }
 
 /**
  * Validate level up attempt
- * @param {Object} player - Player state
- * @param {number} newLevel - Desired new level
- * @returns {Object} { valid: boolean, reason: string }
  */
-function validateLevelUp(player, newLevel) {
+export function validateLevelUp(player, newLevel) {
   if (!player || typeof newLevel !== 'number') {
     return { valid: false, reason: 'Invalid player or level' };
   }
-
-  // Must be exactly one level higher
   if (newLevel !== player.level + 1) {
     return { valid: false, reason: 'Can only level up by one level at a time' };
   }
-
-  // Check if player has enough EXP
   const expRequired = getExpRequiredForLevel(player.level);
   if (player.exp < expRequired) {
     return { valid: false, reason: `Insufficient EXP: need ${expRequired}, have ${player.exp}` };
   }
-
-  // Check level cap
   if (newLevel > 100) {
     return { valid: false, reason: 'Maximum level reached (100)' };
   }
-
   return { valid: true, reason: 'Level up valid' };
 }
 
 /**
  * Validate equip action
- * @param {Object} player - Player state
- * @param {string} itemId - Item ID to equip
- * @returns {Object} { valid: boolean, reason: string }
  */
-function validateEquip(player, itemId) {
+export function validateEquip(player, itemId) {
   if (!player || !itemId) {
     return { valid: false, reason: 'Invalid player or item ID' };
   }
-
-  // Check if item exists in bag
   const bagItem = player.bag.find(item => item.id === itemId);
   if (!bagItem) {
     return { valid: false, reason: 'Item not found in bag' };
   }
-
-  // Check level requirement
   if (bagItem.levelRequirement && player.level < bagItem.levelRequirement) {
     return { valid: false, reason: `Level ${bagItem.levelRequirement} required to equip this item` };
   }
-
-  // Check class requirement
   if (bagItem.classRequirement && bagItem.classRequirement !== player.class) {
     return { valid: false, reason: `This item can only be equipped by ${bagItem.classRequirement}` };
   }
-
   return { valid: true, reason: 'Equip valid' };
 }
 
 /**
  * Validate unequip action
- * @param {Object} player - Player state
- * @param {string} itemId - Item ID to unequip
- * @returns {Object} { valid: boolean, reason: string }
  */
-function validateUnequip(player, itemId) {
+export function validateUnequip(player, itemId) {
   if (!player || !itemId) {
     return { valid: false, reason: 'Invalid player or item ID' };
   }
-
-  // Check if item is equipped
-  const equippedItem = player.equipment[getItemSlot(itemId)];
-  if (!equippedItem || equippedItem.id !== itemId) {
-    return { valid: false, reason: 'Item is not currently equipped' };
+  for (const [slot, item] of Object.entries(player.equipped || {})) {
+    if (item && item.id === itemId) {
+      return { valid: true, reason: 'Unequip valid' };
+    }
   }
-
-  return { valid: true, reason: 'Unequip valid' };
+  return { valid: false, reason: 'Item is not currently equipped' };
 }
 
 /**
  * Validate sell action
- * @param {Object} player - Player state
- * @param {string} itemId - Item ID to sell
- * @returns {Object} { valid: boolean, reason: string }
  */
-function validateSell(player, itemId) {
+export function validateSell(player, itemId) {
   if (!player || !itemId) {
     return { valid: false, reason: 'Invalid player or item ID' };
   }
-
-  // Check if item exists in bag
   const bagItem = player.bag.find(item => item.id === itemId);
   if (!bagItem) {
     return { valid: false, reason: 'Item not found in bag' };
   }
-
-  // Check if item is not locked
   if (bagItem.locked) {
     return { valid: false, reason: 'Item is locked and cannot be sold' };
   }
-
   return { valid: true, reason: 'Sell valid' };
 }
 
 /**
  * Validate forge action
- * @param {Object} player - Player state
- * @param {string} itemId - Item ID to upgrade
- * @param {Array} materials - Required materials
- * @returns {Object} { valid: boolean, reason: string }
  */
-function validateForge(player, itemId, materials) {
-  if (!player || !itemId || !Array.isArray(materials)) {
+export function validateForge(player, itemId) {
+  if (!player || !itemId) {
     return { valid: false, reason: 'Invalid parameters' };
   }
-
-  // Check if item exists in bag or equipment
-  let item = player.bag.find(i => i.id === itemId) || 
-             Object.values(player.equipment).find(i => i && i.id === itemId);
-  
+  let item = player.bag.find(i => i.id === itemId) ||
+             Object.values(player.equipped || {}).find(i => i && i.id === itemId);
   if (!item) {
     return { valid: false, reason: 'Item not found' };
   }
-
-  // Check if item is at max upgrade level (10)
-  if (item.upgradeLevel >= 10) {
+  if ((item.upgradeLevel || 0) >= FORGE_DATA.maxUpgradeLevel) {
     return { valid: false, reason: 'Item is already at maximum upgrade level' };
   }
-
-  // Check if player has enough gold
   const forgeCost = calculateForgeCost(item);
   if (player.gold < forgeCost) {
     return { valid: false, reason: `Insufficient gold: need ${forgeCost}, have ${player.gold}` };
   }
-
-  // Check materials
-  const requiredMaterials = getRequiredMaterials(item);
-  for (const [materialId, amount] of Object.entries(requiredMaterials)) {
-    const playerMaterials = player.materials[materialId] || 0;
-    if (playerMaterials < amount) {
-      return { valid: false, reason: `Insufficient ${materialId}: need ${amount}, have ${playerMaterials}` };
-    }
-  }
-
   return { valid: true, reason: 'Forge valid' };
 }
 
 /**
  * Validate zone change
- * @param {Object} player - Player state
- * @param {string} newZone - Target zone ID
- * @returns {Object} { valid: boolean, reason: string }
  */
-function validateZoneChange(player, newZone) {
+export function validateZoneChange(player, newZone) {
   if (!player || !newZone) {
     return { valid: false, reason: 'Invalid player or zone' };
   }
-
-  // Check if zone exists
-  if (!ZONE_UNLOCK_REQUIREMENTS.hasOwnProperty(newZone)) {
+  const zoneData = ZONE_DATA[newZone];
+  if (!zoneData) {
     return { valid: false, reason: 'Zone does not exist' };
   }
-
-  // Check level requirement
-  const requiredLevel = ZONE_UNLOCK_REQUIREMENTS[newZone];
-  if (player.level < requiredLevel) {
-    return { valid: false, reason: `Level ${requiredLevel} required to access ${newZone}` };
+  if (player.level < zoneData.levelRange.min) {
+    return { valid: false, reason: `Level ${zoneData.levelRange.min} required to access this zone` };
   }
-
-  // Check if already in zone
   if (player.zone === newZone) {
     return { valid: false, reason: 'Already in this zone' };
   }
-
   return { valid: true, reason: 'Zone change valid' };
 }
 
 /**
  * Validate gold spend
- * @param {Object} player - Player state
- * @param {number} amount - Amount to spend
- * @returns {Object} { valid: boolean, reason: string }
  */
-function validateGoldSpend(player, amount) {
+export function validateGoldSpend(player, amount) {
   if (!player || typeof amount !== 'number') {
     return { valid: false, reason: 'Invalid player or amount' };
   }
-
   if (amount <= 0) {
     return { valid: false, reason: 'Amount must be positive' };
   }
-
   if (player.gold < amount) {
     return { valid: false, reason: `Insufficient gold: need ${amount}, have ${player.gold}` };
   }
-
   return { valid: true, reason: 'Gold spend valid' };
 }
 
 // =============================================================================
-// 3. GAME LOGIC FUNCTIONS (Apply Changes)
+// 4. APPLY FUNCTIONS
 // =============================================================================
 
 /**
  * Apply level up - calculate new stats
- * @param {Object} player - Player state
- * @returns {Object} New player state
  */
-function applyLevelUp(player) {
+export function applyLevelUp(player) {
   const newPlayer = { ...player };
   const newLevel = player.level + 1;
-  
-  // Calculate EXP overflow
   const expRequired = getExpRequiredForLevel(player.level);
   const expOverflow = player.exp - expRequired;
 
-  // Get stat growth for class
-  const growth = STAT_GROWTH_PER_LEVEL[player.class] || STAT_GROWTH_PER_LEVEL.warrior;
-
-  // Apply stat growth with randomness (±20%)
+  const growth = STAT_GROWTH[player.class] || STAT_GROWTH.warrior;
   const randomFactor = () => 0.8 + Math.random() * 0.4;
 
   newPlayer.level = newLevel;
   newPlayer.exp = expOverflow;
-  
-  // Update stats with growth
-  newPlayer.stats = {
-    strength: Math.floor((player.stats.strength || 10) + growth.strength * randomFactor()),
-    agility: Math.floor((player.stats.agility || 10) + growth.agility * randomFactor()),
-    intelligence: Math.floor((player.stats.intelligence || 10) + growth.intelligence * randomFactor()),
-    vitality: Math.floor((player.stats.vitality || 10) + growth.vitality * randomFactor())
-  };
 
-  // Recalculate max HP based on vitality
-  newPlayer.maxHp = calculateMaxHp(newPlayer);
-  newPlayer.hp = newPlayer.maxHp; // Full heal on level up
-
-  // Update max MP based on intelligence
-  newPlayer.maxMp = calculateMaxMp(newPlayer);
-  newPlayer.mp = newPlayer.maxMp; // Full MP restore
+  // Full heal on level up
+  newPlayer.hp = newPlayer.maxHp;
+  newPlayer.mp = newPlayer.maxMp;
 
   return newPlayer;
 }
 
 /**
  * Apply item drop - add to bag
- * @param {Object} player - Player state
- * @param {Object} item - Item to add
- * @returns {Object} New player state
  */
-function applyItemDrop(player, item) {
-  const newPlayer = { ...player };
-  newPlayer.bag = [...player.bag, item];
-  
-  // Check bag capacity (max 50 items)
-  if (newPlayer.bag.length > 50) {
-    // Remove oldest items if over capacity
-    newPlayer.bag = newPlayer.bag.slice(-50);
-  }
+export function applyItemDrop(player, item) {
+  const newPlayer = { ...player, bag: [...player.bag] };
+  newPlayer.bag.push(item);
 
+  if (newPlayer.bag.length > BAG_SIZE) {
+    newPlayer.bag = newPlayer.bag.slice(-BAG_SIZE);
+  }
   return newPlayer;
 }
 
 /**
  * Apply equip - equip item
- * @param {Object} player - Player state
- * @param {string} itemId - Item ID to equip
- * @returns {Object} New player state
  */
-function applyEquip(player, itemId) {
-  const newPlayer = { ...player };
+export function applyEquip(player, itemId) {
+  const newPlayer = { ...player, bag: [...player.bag], equipped: { ...player.equipped } };
   const bagIndex = player.bag.findIndex(item => item.id === itemId);
-  
   if (bagIndex === -1) return player;
 
   const item = player.bag[bagIndex];
-  const slot = getItemSlot(item.type);
+  const slot = item.type || 'accessory';
 
   // Unequip current item in slot if any
-  if (newPlayer.equipment[slot]) {
-    newPlayer.bag = [...newPlayer.bag, newPlayer.equipment[slot]];
+  if (newPlayer.equipped[slot]) {
+    newPlayer.bag.push(newPlayer.equipped[slot]);
   }
 
   // Remove from bag and add to equipment
-  newPlayer.bag = [...player.bag.slice(0, bagIndex), ...player.bag.slice(bagIndex + 1)];
-  newPlayer.equipment = { ...player.equipment, [slot]: item };
-
-  // Recalculate stats
-  newPlayer.stats = recalculateStats(newPlayer);
+  newPlayer.bag.splice(bagIndex, 1);
+  newPlayer.equipped[slot] = item;
 
   return newPlayer;
 }
 
 /**
  * Apply unequip - unequip to bag
- * @param {Object} player - Player state
- * @param {string} itemId - Item ID to unequip
- * @returns {Object} New player state
  */
-function applyUnequip(player, itemId) {
-  const newPlayer = { ...player };
-  const slot = getItemSlotById(itemId);
+export function applyUnequip(player, itemId) {
+  const newPlayer = { ...player, bag: [...player.bag], equipped: { ...player.equipped } };
 
-  if (!newPlayer.equipment[slot] || newPlayer.equipment[slot].id !== itemId) {
-    return player;
+  for (const [slot, item] of Object.entries(newPlayer.equipped)) {
+    if (item && item.id === itemId) {
+      newPlayer.bag.push(item);
+      newPlayer.equipped[slot] = null;
+      return newPlayer;
+    }
   }
-
-  // Move to bag
-  newPlayer.bag = [...player.bag, newPlayer.equipment[slot]];
-  newPlayer.equipment = { ...player.equipment, [slot]: null };
-
-  // Recalculate stats
-  newPlayer.stats = recalculateStats(newPlayer);
-
-  return newPlayer;
+  return player;
 }
 
 /**
  * Apply sell - remove from bag, add gold
- * @param {Object} player - Player state
- * @param {string} itemId - Item ID to sell
- * @returns {Object} New player state
  */
-function applySell(player, itemId) {
-  const newPlayer = { ...player };
+export function applySell(player, itemId) {
+  const newPlayer = { ...player, bag: [...player.bag] };
   const bagIndex = player.bag.findIndex(item => item.id === itemId);
-  
   if (bagIndex === -1) return player;
 
   const item = player.bag[bagIndex];
   const sellPrice = calculateSellPrice(item);
 
-  // Remove from bag and add gold
-  newPlayer.bag = [...player.bag.slice(0, bagIndex), ...player.bag.slice(bagIndex + 1)];
+  newPlayer.bag.splice(bagIndex, 1);
   newPlayer.gold = player.gold + sellPrice;
 
   return newPlayer;
@@ -466,236 +331,150 @@ function applySell(player, itemId) {
 
 /**
  * Apply forge - upgrade or destroy item
- * @param {Object} player - Player state
- * @param {string} itemId - Item ID to upgrade
- * @returns {Object} New player state
  */
-function applyForge(player, itemId) {
-  const newPlayer = { ...player };
-  
-  // Find item
-  let item = player.bag.find(i => i.id === itemId) || 
-             Object.values(player.equipment).find(i => i && i.id === itemId);
-  
+export function applyForge(player, itemId) {
+  const newPlayer = { ...player, bag: [...player.bag], equipped: { ...player.equipped } };
+
+  let item = player.bag.find(i => i.id === itemId) ||
+             Object.values(player.equipment || {}).find(i => i && i.id === itemId);
   if (!item) return player;
 
-  // Deduct gold
   const forgeCost = calculateForgeCost(item);
   newPlayer.gold = player.gold - forgeCost;
 
-  // Deduct materials
-  const requiredMaterials = getRequiredMaterials(item);
-  newPlayer.materials = { ...player.materials };
-  for (const [materialId, amount] of Object.entries(requiredMaterials)) {
-    newPlayer.materials[materialId] = (newPlayer.materials[materialId] || 0) - amount;
-  }
-
-  // Roll for success
-  const successChance = FORGE_SUCCESS_RATES[item.rarity] || 0.5;
+  const successChance = FORGE_DATA.getSuccessRate(item.upgradeLevel || 0);
   const success = Math.random() < successChance;
 
   if (success) {
-    // Upgrade item
-    item = { ...item, upgradeLevel: item.upgradeLevel + 1 };
-    
-    // Update stats based on upgrade
-    item.stats = {
-      attack: Math.floor(item.stats.attack * 1.1),
-      defense: Math.floor(item.stats.defense * 1.1),
-      hp: Math.floor(item.stats.hp * 1.05)
-    };
+    item = { ...item, upgradeLevel: (item.upgradeLevel || 0) + 1 };
+    // Boost stats
+    const boost = 1 + 0.1 * (item.upgradeLevel || 1);
+    if (item.atk) item.atk = Math.floor(item.atk * boost);
+    if (item.def) item.def = Math.floor(item.def * boost);
+    if (item.hp) item.hp = Math.floor(item.hp * boost);
   } else {
-    // Destroy item or downgrade
-    if (item.upgradeLevel > 0) {
-      // Downgrade
+    // Failure: downgrade if possible, else destroy
+    if ((item.upgradeLevel || 0) > 0) {
       item = { ...item, upgradeLevel: item.upgradeLevel - 1 };
-      item.stats = {
-        attack: Math.floor(item.stats.attack / 1.1),
-        defense: Math.floor(item.stats.defense / 1.1),
-        hp: Math.floor(item.stats.hp / 1.05)
-      };
     } else {
       // Destroy item
-      if (player.bag.some(i => i.id === itemId)) {
-        newPlayer.bag = player.bag.filter(i => i.id !== itemId);
+      const bagIdx = newPlayer.bag.findIndex(i => i.id === itemId);
+      if (bagIdx !== -1) {
+        newPlayer.bag.splice(bagIdx, 1);
       } else {
-        const slot = getItemSlotById(itemId);
-        newPlayer.equipment = { ...player.equipment, [slot]: null };
+        for (const [slot, eq] of Object.entries(newPlayer.equipped)) {
+          if (eq && eq.id === itemId) { newPlayer.equipped[slot] = null; break; }
+        }
       }
-      
-      // Recalculate stats if item was equipped
-      newPlayer.stats = recalculateStats(newPlayer);
       return newPlayer;
     }
   }
 
   // Update item in bag or equipment
-  if (player.bag.some(i => i.id === itemId)) {
-    newPlayer.bag = player.bag.map(i => i.id === itemId ? item : i);
+  const bagIdx = newPlayer.bag.findIndex(i => i.id === itemId);
+  if (bagIdx !== -1) {
+    newPlayer.bag[bagIdx] = item;
   } else {
-    const slot = getItemSlotById(itemId);
-    newPlayer.equipment = { ...player.equipment, [slot]: item };
+    for (const [slot, eq] of Object.entries(newPlayer.equipped)) {
+      if (eq && eq.id === itemId) { newPlayer.equipped[slot] = item; break; }
+    }
   }
-
-  // Recalculate stats if item was equipped
-  newPlayer.stats = recalculateStats(newPlayer);
 
   return newPlayer;
 }
 
 /**
  * Apply zone change
- * @param {Object} player - Player state
- * @param {string} newZone - Target zone
- * @returns {Object} New player state
  */
-function applyZoneChange(player, newZone) {
-  const newPlayer = { ...player };
-  newPlayer.zone = newZone;
-  
-  // Reset combat state
-  newPlayer.currentMonster = null;
-  newPlayer.inCombat = false;
-  
-  // Restore some HP/MP when changing zones
-  newPlayer.hp = Math.min(player.hp + Math.floor(player.maxHp * 0.1), player.maxHp);
-  newPlayer.mp = Math.min(player.mp + Math.floor(player.maxMp * 0.2), player.maxMp);
-
-  return newPlayer;
+export function applyZoneChange(player, newZone) {
+  return { ...player, zone: newZone, zoneKills: 0 };
 }
 
 /**
  * Apply gold spend
- * @param {Object} player - Player state
- * @param {number} amount - Amount to spend
- * @returns {Object} New player state
  */
-function applyGoldSpend(player, amount) {
-  const newPlayer = { ...player };
-  newPlayer.gold = player.gold - amount;
-  return newPlayer;
+export function applyGoldSpend(player, amount) {
+  return { ...player, gold: player.gold - amount };
 }
 
 // =============================================================================
-// 4. HELPER FUNCTIONS
+// 5. HELPER FUNCTIONS
 // =============================================================================
 
 /**
- * Calculate combat damage
- * @param {Object} attacker - Attacker stats
- * @param {Object} defender - Defender stats
- * @returns {number} Damage dealt
+ * Get equipment slot for item type
  */
-function calculateDamage(attacker, defender) {
-  // Base damage from attack
-  const baseDamage = attacker.attack || 10;
-  
-  // Defense reduction
-  const defense = defender.defense || 5;
-  
-  // Critical hit chance (10% base)
-  const critChance = 0.1 + (attacker.agility || 0) * 0.001;
-  const isCrit = Math.random() < critChance;
-  
-  // Critical multiplier
-  const critMultiplier = isCrit ? 1.5 : 1.0;
-  
-  // Random variance (±10%)
-  const variance = 0.9 + Math.random() * 0.2;
-  
-  // Calculate final damage
-  let damage = (baseDamage - defense * 0.5) * critMultiplier * variance;
-  
-  // Minimum damage is 1
-  damage = Math.max(1, Math.floor(damage));
+export function getItemSlot(itemType) {
+  const slotMap = {
+    'weapon': 'weapon', 'armor': 'armor', 'accessory': 'accessory',
+    'helmet': 'helmet', 'shield': 'shield'
+  };
+  return slotMap[itemType] || 'accessory';
+}
 
+/**
+ * Calculate sell price
+ */
+export function calculateSellPrice(item) {
+  if (!item) return 0;
+  const baseValue = item.value || 100;
+  const upgradeMultiplier = 1 + (item.upgradeLevel || 0) * 0.2;
+  const rarityMultiplier = RARITY_TABLE[item.rarity]?.multiplier || 1.0;
+  return Math.floor(baseValue * upgradeMultiplier * rarityMultiplier * 0.3);
+}
+
+/**
+ * Calculate forge cost
+ */
+export function calculateForgeCost(item) {
+  if (!item) return 0;
+  return FORGE_DATA.getUpgradeCost(item.upgradeLevel || 0);
+}
+
+/**
+ * Calculate damage between attacker and defender
+ */
+function calculateDamage(attackerAtk, defenderDef) {
+  const critChance = 0.10;
+  const isCrit = Math.random() < critChance;
+  const critMultiplier = isCrit ? 1.5 : 1.0;
+  const variance = 0.9 + Math.random() * 0.2;
+  let damage = (attackerAtk - defenderDef / 2) * critMultiplier * variance;
+  damage = Math.max(1, Math.floor(damage));
   return { damage, isCrit };
 }
 
 /**
- * Calculate EXP reward
- * @param {number} monsterLevel - Monster level
- * @param {number} playerLevel - Player level
- * @returns {number} EXP gained
+ * Generate a loot item from a monster
  */
-function calculateExpReward(monsterLevel, playerLevel) {
-  // Base EXP from monster level
-  const baseExp = monsterLevel * 10;
-  
-  // Level difference penalty
-  const levelDiff = playerLevel - monsterLevel;
-  let multiplier = 1.0;
-  
-  if (levelDiff > 5) {
-    // Too high level - reduced EXP
-    multiplier = Math.max(0.1, 1.0 - (levelDiff - 5) * 0.1);
-  } else if (levelDiff < -5) {
-    // Too low level - bonus EXP
-    multiplier = 1.0 + Math.abs(levelDiff + 5) * 0.05;
-  }
+function generateLoot(monsterLevel) {
+  const rarity = getRandomRarity();
+  const rarityData = RARITY_TABLE[rarity];
+  if (!rarityData) return null;
 
-  return Math.floor(baseExp * multiplier);
-}
-
-/**
- * Generate random loot
- * @param {number} monsterLevel - Monster level
- * @param {number} luck - Player luck stat
- * @returns {Object|null} Generated item or null
- */
-function generateLoot(monsterLevel, luck = 0) {
-  // Drop chance based on luck (base 30%)
-  const dropChance = 0.3 + luck * 0.005;
-  if (Math.random() > dropChance) {
-    return null;
-  }
-
-  // Determine rarity
-  const rarityRoll = Math.random();
-  let rarity = 'common';
-  let cumulative = 0;
-  
-  for (const [r, chance] of Object.entries(RARITY_CHANCES)) {
-    cumulative += chance;
-    if (rarityRoll <= cumulative) {
-      rarity = r;
-      break;
-    }
-  }
-
-  // Generate item based on monster level and rarity
-  const baseAttack = Math.floor(monsterLevel * 2 + Math.random() * 5);
-  const baseDefense = Math.floor(monsterLevel * 1.5 + Math.random() * 3);
-  const baseHp = Math.floor(monsterLevel * 10 + Math.random() * 20);
-
-  // Rarity multipliers
-  const rarityMultipliers = {
-    common: 1.0,
-    uncommon: 1.2,
-    rare: 1.5,
-    epic: 2.0,
-    legendary: 3.0
-  };
-
-  const multiplier = rarityMultipliers[rarity] || 1.0;
-
-  // Determine item type
+  const multiplier = rarityData.multiplier;
   const itemTypes = ['weapon', 'armor', 'accessory'];
   const itemType = itemTypes[Math.floor(Math.random() * itemTypes.length)];
 
-  // Generate unique ID
+  const baseAtk = Math.floor(monsterLevel * 2 + Math.random() * 5);
+  const baseDef = Math.floor(monsterLevel * 1.5 + Math.random() * 3);
+  const baseHp = Math.floor(monsterLevel * 10 + Math.random() * 20);
+
   const itemId = `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
   return {
     id: itemId,
-    name: `${rarity.charAt(0).toUpperCase() + rarity.slice(1)} ${itemType}`,
+    name: `${rarity} ${itemType.charAt(0).toUpperCase() + itemType.slice(1)}`,
     type: itemType,
     rarity,
     upgradeLevel: 0,
     levelRequirement: Math.max(1, monsterLevel - 2),
+    atk: itemType === 'weapon' ? Math.floor(baseAtk * multiplier) : 0,
+    def: (itemType === 'armor' || itemType === 'accessory') ? Math.floor(baseDef * multiplier) : 0,
+    hp: itemType === 'armor' ? Math.floor(baseHp * multiplier) : 0,
     stats: {
-      attack: Math.floor(baseAttack * multiplier),
-      defense: Math.floor(baseDefense * multiplier),
+      attack: Math.floor(baseAtk * multiplier),
+      defense: Math.floor(baseDef * multiplier),
       hp: Math.floor(baseHp * multiplier)
     },
     value: Math.floor(100 * multiplier * monsterLevel)
@@ -703,207 +482,186 @@ function generateLoot(monsterLevel, luck = 0) {
 }
 
 /**
- * Calculate sell price
- * @param {Object} item - Item to sell
- * @returns {number} Gold value
+ * Generate random loot (compatibility export)
  */
-function calculateSellPrice(item) {
-  if (!item) return 0;
-
-  // Base value from item
-  const baseValue = item.value || 100;
-
-  // Upgrade bonus
-  const upgradeMultiplier = 1 + (item.upgradeLevel || 0) * 0.2;
-
-  // Rarity multiplier
-  const rarityMultipliers = {
-    common: 1.0,
-    uncommon: 1.5,
-    rare: 2.0,
-    epic: 3.0,
-    legendary: 5.0
-  };
-  const rarityMultiplier = rarityMultipliers[item.rarity] || 1.0;
-
-  // Sell price is 30% of value
-  return Math.floor(baseValue * upgradeMultiplier * rarityMultiplier * 0.3);
-}
-
-/**
- * Calculate forge cost
- * @param {Object} item - Item to forge
- * @returns {number} Gold cost
- */
-function calculateForgeCost(item) {
-  if (!item) return 0;
-
-  const baseCost = 100;
-  const levelMultiplier = item.upgradeLevel || 0;
-  const rarityMultiplier = {
-    common: 1,
-    uncommon: 1.5,
-    rare: 2,
-    epic: 3,
-    legendary: 5
-  }[item.rarity] || 1;
-
-  return Math.floor(baseCost * (1 + levelMultiplier * 0.5) * rarityMultiplier);
-}
-
-/**
- * Get required materials for forge
- * @param {Object} item - Item to forge
- * @returns {Object} Materials needed
- */
-function getRequiredMaterials(item) {
-  if (!item) return {};
-
-  const baseMaterials = {
-    'iron_ore': 5 + (item.upgradeLevel || 0) * 2,
-    'magic_dust': 2 + Math.floor((item.upgradeLevel || 0) * 0.5)
-  };
-
-  // Add rarity-specific materials
-  if (item.rarity === 'epic' || item.rarity === 'legendary') {
-    baseMaterials['rare_gem'] = 1 + Math.floor((item.upgradeLevel || 0) * 0.2);
-  }
-
-  return baseMaterials;
+export function generateLootDrop(monsterLevel, luck = 0) {
+  const dropChance = 0.3 + luck * 0.005;
+  if (Math.random() > dropChance) return null;
+  return generateLoot(monsterLevel);
 }
 
 // =============================================================================
-// HELPER: Slot Mapping
+// 6. SERVER-AUTHORITATIVE COMBAT TICK
 // =============================================================================
 
 /**
- * Get equipment slot for item type
+ * Process a combat tick - server calculates all combat results
+ * @param {Object} player - DB player row (raw from database)
+ * @param {number} zoneKey - Current zone number
+ * @param {Array} monstersInZone - Array of monster keys from zone
+ * @returns {Object} { attacks, expGained, goldGained, itemsDropped, levelUps, newStats }
  */
-function getItemSlot(itemType) {
-  const slotMap = {
-    'weapon': 'weapon',
-    'armor': 'armor',
-    'accessory': 'accessory',
-    'helmet': 'helmet',
-    'shield': 'shield'
-  };
-  return slotMap[itemType] || 'accessory';
-}
-
-/**
- * Get equipment slot by item ID
- */
-function getItemSlotById(itemId) {
-  // This would require lookup against player.equipment
-  // For simplicity, return 'accessory' as default
-  return 'accessory';
-}
-
-/**
- * Calculate max HP based on stats
- */
-function calculateMaxHp(player) {
-  const baseHp = 100;
-  const vitalityBonus = (player.stats.vitality || 0) * 10;
-  const equipmentBonus = Object.values(player.equipment)
-    .filter(item => item && item.stats.hp)
-    .reduce((sum, item) => sum + item.stats.hp, 0);
-  
-  return baseHp + vitalityBonus + equipmentBonus;
-}
-
-/**
- * Calculate max MP based on stats
- */
-function calculateMaxMp(player) {
-  const baseMp = 50;
-  const intelligenceBonus = (player.stats.intelligence || 0) * 5;
-  return baseMp + intelligenceBonus;
-}
-
-/**
- * Recalculate all player stats from equipment
- */
-function recalculateStats(player) {
-  const baseStats = {
-    strength: 10,
-    agility: 10,
-    intelligence: 10,
-    vitality: 10
-  };
-
-  // Add level bonuses
-  const growth = STAT_GROWTH_PER_LEVEL[player.class] || STAT_GROWTH_PER_LEVEL.warrior;
-  for (let i = 1; i < player.level; i++) {
-    baseStats.strength += growth.strength;
-    baseStats.agility += growth.agility;
-    baseStats.intelligence += growth.intelligence;
-    baseStats.vitality += growth.vitality;
+export function processCombatTick(player, zoneKey, monstersInZone) {
+  const gamePlayer = dbPlayerToGame(player);
+  const zone = ZONE_DATA[zoneKey];
+  if (!zone || !monstersInZone || monstersInZone.length === 0) {
+    return { attacks: [], expGained: 0, goldGained: 0, itemsDropped: [], levelUps: 0, newStats: null };
   }
 
-  // Add equipment bonuses
-  Object.values(player.equipment).forEach(item => {
-    if (item && item.stats) {
-      if (item.stats.strength) baseStats.strength += item.stats.strength;
-      if (item.stats.agility) baseStats.agility += item.stats.agility;
-      if (item.stats.intelligence) baseStats.intelligence += item.stats.intelligence;
-      if (item.stats.vitality) baseStats.vitality += item.stats.vitality;
+  // Pick 2-4 random monsters
+  const numMobs = 2 + Math.floor(Math.random() * 3); // 2, 3, or 4
+  const selectedMonsters = [];
+  for (let i = 0; i < numMobs; i++) {
+    const key = monstersInZone[Math.floor(Math.random() * monstersInZone.length)];
+    if (MONSTER_DATA[key]) {
+      selectedMonsters.push({ key, ...MONSTER_DATA[key] });
     }
-  });
+  }
+
+  const attacks = [];
+  let totalExp = 0;
+  let totalGold = 0;
+  const itemsDropped = [];
+  let kills = 0;
+
+  for (const monster of selectedMonsters) {
+    // Hero attacks monster
+    const heroDmg = calculateDamage(gamePlayer.atk, monster.def);
+    const monsterDead = heroDmg.damage >= monster.hp;
+
+    // Monster attacks hero (if alive)
+    let monsterDmg = { damage: 0, isCrit: false };
+    if (!monsterDead) {
+      monsterDmg = calculateDamage(monster.atk, gamePlayer.def);
+    }
+
+    const attackResult = {
+      monsterKey: monster.key,
+      monsterName: monster.name,
+      monsterLevel: monster.level,
+      heroDamage: heroDmg.damage,
+      heroCrit: heroDmg.isCrit,
+      monsterDamage: monsterDead ? 0 : monsterDmg.damage,
+      monsterCrit: monsterDead ? false : monsterDmg.isCrit,
+      monsterKilled: monsterDead
+    };
+
+    if (monsterDead) {
+      kills++;
+      // Roll exp/gold rewards (with zone multiplier)
+      const expReward = Math.floor(monster.expReward * (zone.expMultiplier || 1));
+      const goldReward = Math.floor(monster.goldReward * (zone.goldMultiplier || 1));
+      totalExp += expReward;
+      totalGold += goldReward;
+
+      attackResult.expReward = expReward;
+      attackResult.goldReward = goldReward;
+
+      // Roll item drop (30% base chance per monster)
+      if (Math.random() < 0.30) {
+        const loot = generateLoot(monster.level);
+        if (loot) {
+          itemsDropped.push(loot);
+          attackResult.itemDrop = loot;
+        }
+      }
+    }
+
+    attacks.push(attackResult);
+  }
+
+  // Apply rewards to player
+  let newExp = gamePlayer.exp + totalExp;
+  let newGold = gamePlayer.gold + totalGold;
+  let newLevel = gamePlayer.level;
+  let levelUps = 0;
+
+  // Check for level ups (can chain multiple)
+  while (newLevel < 100) {
+    const req = getExpRequiredForLevel(newLevel);
+    if (newExp >= req) {
+      newExp -= req;
+      newLevel++;
+      levelUps++;
+    } else {
+      break;
+    }
+  }
+
+  // Add items to bag
+  let newBag = [...gamePlayer.bag];
+  for (const item of itemsDropped) {
+    if (newBag.length < BAG_SIZE) {
+      newBag.push(item);
+    }
+  }
 
   return {
-    strength: Math.floor(baseStats.strength),
-    agility: Math.floor(baseStats.agility),
-    intelligence: Math.floor(baseStats.intelligence),
-    vitality: Math.floor(baseStats.vitality)
+    attacks,
+    expGained: totalExp,
+    goldGained: totalGold,
+    itemsDropped,
+    levelUps,
+    newStats: {
+      level: newLevel,
+      exp: newExp,
+      gold: newGold,
+      totalKills: gamePlayer.totalKills + kills,
+      zoneKills: gamePlayer.zoneKills + kills,
+      bag: newBag
+    }
   };
 }
 
 // =============================================================================
-// EXPORTS
+// 7. OFFLINE PROGRESS CALCULATION
+// =============================================================================
+
+/**
+ * Calculate offline passive gains (no combat simulation)
+ * @param {Object} player - DB player row
+ * @param {string|null} lastOnlineTimestamp - ISO timestamp of last online
+ * @returns {Object} { duration, expGained, goldGained }
+ */
+export function calculateOfflineProgress(player, lastOnlineTimestamp) {
+  if (!lastOnlineTimestamp) {
+    return { duration: 0, expGained: 0, goldGained: 0 };
+  }
+
+  const lastOnline = new Date(lastOnlineTimestamp).getTime();
+  const now = Date.now();
+  let elapsedMs = now - lastOnline;
+
+  // Cap at 8 hours
+  const MAX_OFFLINE_MS = 8 * 60 * 60 * 1000;
+  elapsedMs = Math.min(elapsedMs, MAX_OFFLINE_MS);
+
+  if (elapsedMs <= 0) {
+    return { duration: 0, expGained: 0, goldGained: 0 };
+  }
+
+  const hours = elapsedMs / (60 * 60 * 1000);
+  const level = player.level || 1;
+  const zone = player.zone || 1;
+  const zoneData = ZONE_DATA[zone] || ZONE_DATA[1];
+  const zoneMultiplier = zoneData.expMultiplier || 1.0;
+
+  // Passive gains: no combat, just time-based
+  const expGained = Math.floor(level * 10 * hours * zoneMultiplier);
+  const goldGained = Math.floor(level * 5 * hours * zoneMultiplier);
+
+  return {
+    duration: Math.floor(elapsedMs / 1000), // seconds
+    expGained,
+    goldGained
+  };
+}
+
+// =============================================================================
+// 8. EXPORTS
 // =============================================================================
 
 export {
-  // Constants
-  EXP_PER_LEVEL,
-  STAT_GROWTH_PER_LEVEL,
-  RARITY_CHANCES,
-  FORGE_SUCCESS_RATES,
-  ZONE_UNLOCK_REQUIREMENTS,
-  
-  // Helper functions
-  getExpRequiredForLevel,
-  calculateDamage,
-  calculateExpReward,
-  generateLoot,
-  calculateSellPrice,
-  calculateForgeCost,
-  getRequiredMaterials,
-  
-  // Validation functions
-  validateItemDrop,
-  validateLevelUp,
-  validateEquip,
-  validateUnequip,
-  validateSell,
-  validateForge,
-  validateZoneChange,
-  validateGoldSpend,
-  
-  // Apply functions
-  applyLevelUp,
-  applyItemDrop,
-  applyEquip,
-  applyUnequip,
-  applySell,
-  applyForge,
-  applyZoneChange,
-  applyGoldSpend,
-  
-  // Internal helpers (for testing)
-  calculateMaxHp,
-  calculateMaxMp,
-  recalculateStats,
-  getItemSlot,
-  getItemSlotById
+  COMBAT_TICK_MS,
+  BAG_SIZE
 };
