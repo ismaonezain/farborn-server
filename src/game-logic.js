@@ -282,7 +282,7 @@ export function applyEquip(player, itemId) {
   if (bagIndex === -1) return player;
 
   const item = player.bag[bagIndex];
-  const slot = item.type || 'accessory';
+  const slot = item.slot || item.type || 'accessory';
 
   // Unequip current item in slot if any
   if (newPlayer.equipped[slot]) {

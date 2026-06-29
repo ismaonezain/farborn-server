@@ -245,46 +245,60 @@ app.post('/api/sync/events', requireAuth, async (req, res) => {
           }
           
           case 'item_equip': {
-            const { itemId } = data;
-            const equipResult = validateEquip(tempPlayer, itemId);
-            if (!equipResult.valid) { reason = equipResult.reason; break; }
-            const applied = applyEquip(tempPlayer, itemId);
-            bag = applied.bag;
-            equipped = applied.equipped;
+            // Client sends { item, slot, old } or { itemId }
+            const itemId = data.itemId || (data.item && data.item.id);
+            if (!itemId) { reason = 'Missing itemId'; break; }
+            const bagIndex = bag.findIndex(i => i.id === itemId);
+            if (bagIndex === -1) {
+              const alreadyEquipped = Object.values(equipped).some(e => e && e.id === itemId);
+              if (alreadyEquipped) { valid = true; break; }
+              reason = 'Item not found in bag';
+              break;
+            }
+            const item = bag[bagIndex];
+            const slot = item.slot || item.type || data.slot || 'accessory';
+            if (equipped[slot]) { bag.push(equipped[slot]); }
+            equipped[slot] = item;
+            bag.splice(bagIndex, 1);
             valid = true;
             break;
           }
           
           case 'item_unequip': {
-            const { itemId } = data;
-            const unequipResult = validateUnequip(tempPlayer, itemId);
-            if (!unequipResult.valid) { reason = unequipResult.reason; break; }
-            const applied = applyUnequip(tempPlayer, itemId);
-            bag = applied.bag;
-            equipped = applied.equipped;
+            const itemId = data.itemId || (data.item && data.item.id);
+            if (!itemId) { reason = 'Missing itemId'; break; }
+            let found = false;
+            for (const [s, eq] of Object.entries(equipped)) {
+              if (eq && eq.id === itemId) { bag.push(eq); equipped[s] = null; found = true; break; }
+            }
+            if (!found) { reason = 'Item not found in equipment'; break; }
             valid = true;
             break;
           }
           
           case 'item_sell': {
-            const { itemId } = data;
-            const sellResult = validateSell(tempPlayer, itemId);
-            if (!sellResult.valid) { reason = sellResult.reason; break; }
-            const applied = applySell(tempPlayer, itemId);
-            bag = applied.bag;
-            gold = applied.gold;
+            const itemId = data.itemId || (data.item && data.item.id);
+            if (!itemId) { reason = 'Missing itemId'; break; }
+            const bagIndex = bag.findIndex(i => i.id === itemId);
+            if (bagIndex === -1) { reason = 'Item not found in bag'; break; }
+            const item = bag[bagIndex];
+            const sellPrice = data.gold || Math.floor((item.atk || 0) + (item.def || 0) + (item.hp || 0) + 10);
+            gold += sellPrice;
+            bag.splice(bagIndex, 1);
             valid = true;
             break;
           }
           
           case 'forge_upgrade': {
-            const { itemId } = data;
-            const forgeResult = validateForge(tempPlayer, itemId);
-            if (!forgeResult.valid) { reason = forgeResult.reason; break; }
-            const applied = applyForge(tempPlayer, itemId);
-            bag = applied.bag;
-            equipped = applied.equipped;
-            gold = applied.gold;
+            const itemId = data.itemId || (data.item && data.item.id);
+            if (!itemId) { reason = 'Missing itemId'; break; }
+            const bagIdx = bag.findIndex(i => i.id === itemId);
+            const eqIdx = Object.values(equipped).findIndex(e => e && e.id === itemId);
+            if (bagIdx === -1 && eqIdx === -1) { reason = 'Item not found'; break; }
+            gold -= data.cost || 0;
+            if (data.success && bagIdx !== -1) {
+              bag[bagIdx].forgeLevel = (bag[bagIdx].forgeLevel || 0) + 1;
+            }
             valid = true;
             break;
           }
