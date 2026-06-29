@@ -62,22 +62,22 @@ app.post('/api/auth/login', async (req, res) => {
 
     const walletLower = wallet.toLowerCase();
 
-    // Check if wallet already linked to different FID
+    // Check if wallet already linked to different FID — re-link it
     const walletOwner = await getOne('SELECT fid FROM players WHERE wallet = ?', [walletLower]);
     if (walletOwner && walletOwner.fid !== fid) {
-      return res.status(409).json({ 
-        error: 'Wallet already linked to another account', 
-        linkedFid: walletOwner.fid 
-      });
+      // Delete old player data and re-link to new FID
+      await run('DELETE FROM login_tokens WHERE fid = ?', [walletOwner.fid]);
+      await run('DELETE FROM players WHERE fid = ?', [walletOwner.fid]);
+      console.log(`🔗 Re-linked wallet from FID ${walletOwner.fid} to ${fid}`);
     }
 
-    // Check if username already taken by different FID
+    // Check if username already taken by different FID — allow reclaim
     const usernameOwner = await getOne('SELECT fid FROM players WHERE username = ? AND fid != ?', [username, fid]);
     if (usernameOwner) {
-      return res.status(409).json({ 
-        error: 'Username already taken', 
-        ownerFid: usernameOwner.fid 
-      });
+      // Delete old player and let new FID take the username
+      await run('DELETE FROM login_tokens WHERE fid = ?', [usernameOwner.fid]);
+      await run('DELETE FROM players WHERE fid = ?', [usernameOwner.fid]);
+      console.log(`🔗 Reclaimed username from FID ${usernameOwner.fid} to ${fid}`);
     }
 
     // Create or update player
