@@ -1,0 +1,36 @@
+app = 'farborn-server'
+primary_region = 'sin'
+
+[build]
+
+[env]
+  PORT = '3001'
+  ALLOWED_ORIGINS = 'https://farborn-client.vercel.app'
+  ADMIN_KEY = 'farborn-prod-2026'
+  BASE_RPC_URL = 'https://mainnet.base.org'
+  FARBORN_TOKEN_ADDRESS = '0x4abD609B323ce6E7C0770E86d21E76BA00209DE2'
+
+[[services]]
+  internal_port = 3001
+  protocol = 'tcp'
+
+  [[services.ports]]
+    port = 80
+    handlers = ['http']
+
+  [[services.ports]]
+    port = 443
+    handlers = ['tls', 'http']
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256

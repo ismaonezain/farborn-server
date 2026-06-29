@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import db from './db.js';
+import { getOne, getAll, run } from './db.js';
 import { generateLoginToken, requireAuth } from './auth.js';
 import {
   validateGoldClaim, processGoldClaim, updatePlayer, getPlayer, getDailyStats,
@@ -10,6 +10,13 @@ import {
   applyGoldSink, GOLD_SINKS, recordPricePoint,
   updateGoldSupply, incrementRecentClaims, decayActivity
 } from './economy.js';
+import {
+  validateItemDrop, validateLevelUp, validateEquip, validateUnequip,
+  validateSell, validateForge, validateZoneChange, validateGoldSpend,
+  applyLevelUp, applyItemDrop, applyEquip, applyUnequip,
+  applySell, applyForge, applyZoneChange, applyGoldSpend,
+  generateLoot, calculateSellPrice, calculateForgeCost
+} from './game-logic.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -19,111 +26,404 @@ app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(',') || '*' }));
 app.use(express.json());
 
 // ─── Health ──────────────────────────────────────────────
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ─── Auth: Farcaster login ──────────────────────────────
-// Client sends FID + username + wallet after Farcaster SDK auth
-app.post('/api/auth/login', (req, res) => {
-  const { fid, username, wallet } = req.body;
-
-  if (!fid || !username || !wallet) {
-    return res.status(400).json({ error: 'Missing fid, username, or wallet' });
+// ─── Farcaster user lookup (proxy to avoid CORS) ────────
+app.get('/api/farcaster/user/:fid', async (req, res) => {
+  try {
+    const fid = req.params.fid;
+    const r = await fetch(`https://api.farcaster.xyz/v2/user?fid=${fid}`);
+    const data = await r.json();
+    const user = data?.result?.user;
+    if (user) {
+      res.json({ fid: user.fid, username: user.username, displayName: user.displayName, pfpUrl: user.pfp?.url });
+    } else {
+      res.json({ error: 'not found' });
+    }
+  } catch (e) {
+    res.json({ error: e.message });
   }
+});
 
-  // Validate wallet address format
-  if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
-    return res.status(400).json({ error: 'Invalid wallet address' });
+// ─── Auth: login ─────────────────────────────────────────
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { fid, username, wallet } = req.body;
+    if (!fid || !username || !wallet) {
+      return res.status(400).json({ error: 'Missing fid, username, or wallet' });
+    }
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
+      return res.status(400).json({ error: 'Invalid wallet address' });
+    }
+
+    const walletLower = wallet.toLowerCase();
+
+    // Check if wallet already linked to different FID
+    const walletOwner = await getOne('SELECT fid FROM players WHERE wallet = ?', [walletLower]);
+    if (walletOwner && walletOwner.fid !== fid) {
+      return res.status(409).json({ 
+        error: 'Wallet already linked to another account',
+        linkedFid: walletOwner.fid 
+      });
+    }
+
+    // Check if username already taken by different FID
+    const usernameOwner = await getOne('SELECT fid FROM players WHERE username = ? AND fid != ?', [username, fid]);
+    if (usernameOwner) {
+      return res.status(409).json({ 
+        error: 'Username already taken',
+        ownerFid: usernameOwner.fid 
+      });
+    }
+
+    // Create or update player
+    const existing = await getOne('SELECT fid FROM players WHERE fid = ?', [fid]);
+    if (!existing) {
+      await run('INSERT INTO players (fid, username, wallet, hero_name) VALUES (?, ?, ?, ?)', [fid, username, walletLower, username]);
+    } else {
+      await run('UPDATE players SET username = ?, wallet = ?, updated_at = datetime(\'now\') WHERE fid = ?', [username, walletLower, fid]);
+    }
+
+    const { token, expiresAt } = await generateLoginToken(fid, username, wallet);
+    const player = await getPlayer(fid);
+    res.json({ token, expiresAt, player });
+  } catch (err) {
+    console.error('Login error:', err);
+    // Handle unique constraint violations
+    if (err.message?.includes('UNIQUE constraint failed')) {
+      if (err.message.includes('wallet')) {
+        return res.status(409).json({ error: 'Wallet already linked to another account' });
+      }
+      if (err.message.includes('username')) {
+        return res.status(409).json({ error: 'Username already taken' });
+      }
+    }
+    res.status(500).json({ error: 'Server error' });
   }
-
-  // Upsert player
-  const existing = db.prepare('SELECT fid FROM players WHERE fid = ?').get(fid);
-  if (!existing) {
-    db.prepare(`
-      INSERT INTO players (fid, username, wallet, hero_name)
-      VALUES (?, ?, ?, ?)
-    `).run(fid, username, wallet.toLowerCase(), username);
-  } else {
-    // Update username/wallet if changed
-    db.prepare('UPDATE players SET username = ?, wallet = ?, updated_at = datetime(\'now\') WHERE fid = ?')
-      .run(username, wallet.toLowerCase(), fid);
-  }
-
-  const { token, expiresAt } = generateLoginToken(fid, username, wallet);
-  const player = getPlayer(fid);
-
-  res.json({ token, expiresAt, player });
 });
 
 // ─── Player state ───────────────────────────────────────
-app.get('/api/player', requireAuth, (req, res) => {
-  const player = getPlayer(req.fid);
+app.get('/api/player', requireAuth, async (req, res) => {
+  const player = await getPlayer(req.fid);
   if (!player) return res.status(404).json({ error: 'Player not found' });
   res.json({ player });
 });
 
-app.put('/api/player', requireAuth, (req, res) => {
-  const { level, zone, gold, equipped, bag } = req.body;
-  updatePlayer(req.fid, { level, zone, gold, equipped, bag });
-  const player = getPlayer(req.fid);
+app.put('/api/player', requireAuth, async (req, res) => {
+  const { level, zone, gold, equipped, bag, class: heroClass } = req.body;
+  const updates = { level, zone, gold, equipped, bag };
+  if (heroClass) updates.class = heroClass;
+  await updatePlayer(req.fid, updates);
+  const player = await getPlayer(req.fid);
   res.json({ player });
 });
 
-// ─── Pricing (Supply & Demand) ──────────────────────────
-app.get('/api/prices', (req, res) => {
-  res.json(getPrices());
+// ─── Sync: Full State (GET = read, POST = write) ─────────
+app.get('/api/sync/state', requireAuth, async (req, res) => {
+  const player = await getPlayer(req.fid);
+  if (!player) return res.status(404).json({ error: 'Player not found' });
+  res.json({ player });
 });
 
-app.get('/api/economy', (req, res) => {
-  res.json(getEconomyDashboard());
-});
-
-app.get('/api/economy/inflation', (req, res) => {
-  res.json(getInflationMetrics());
-});
-
-// ─── Gold → Token conversion (dynamic pricing) ──────────
-app.post('/api/convert', requireAuth, (req, res) => {
-  const { goldAmount, level } = req.body;
-
-  const validation = validateGoldClaim(req.fid, goldAmount, level);
-  if (!validation.valid) {
-    return res.status(400).json({ error: validation.error });
+app.post('/api/sync/state', requireAuth, async (req, res) => {
+  try {
+    const { level, zone, gold, exp, equipped, bag, class: heroClass, upg, skillIdx, totalKills, zoneKills, prestige, prestigeMult, ts } = req.body;
+    
+    // Get current server state
+    const current = await getPlayer(req.fid);
+    if (!current) return res.status(404).json({ error: 'Player not found' });
+    
+    // Conflict resolution: server wins for most, but merge intelligently
+    const updates = {};
+    
+    // Level: take higher
+    if (level && (!current.level || level > current.level)) updates.level = level;
+    
+    // Zone: take higher
+    if (zone !== undefined && zone > (current.zone || 0)) updates.zone = zone;
+    
+    // Gold: take higher (both could earn offline)
+    if (gold !== undefined && gold > (current.gold || 0)) updates.gold = gold;
+    
+    // Equipped: server is source of truth (already synced via events)
+    if (equipped) updates.equipped = equipped;
+    
+    // Bag: merge items (server + local new items)
+    if (bag && current.bag) {
+      const serverItemIds = new Set(current.bag.map(i => i.id));
+      const localOnly = bag.filter(i => !serverItemIds.has(i.id));
+      if (localOnly.length > 0) {
+        updates.bag = [...current.bag, ...localOnly];
+      }
+    }
+    
+    // Class
+    if (heroClass) updates.class = heroClass;
+    
+    // Upgrades
+    if (upg) updates.upg = JSON.stringify(upg);
+    
+    // Skill
+    if (skillIdx !== undefined) updates.skillIdx = skillIdx;
+    
+    // Kills
+    if (totalKills && (!current.totalKills || totalKills > current.totalKills)) updates.totalKills = totalKills;
+    if (zoneKills !== undefined) updates.zoneKills = zoneKills;
+    
+    // Prestige
+    if (prestige !== undefined && prestige > (current.prestige || 0)) updates.prestige = prestige;
+    if (prestigeMult !== undefined && prestigeMult > (current.prestigeMult || 1)) updates.prestigeMult = prestigeMult;
+    
+    // Apply updates
+    if (Object.keys(updates).length > 0) {
+      await updatePlayer(req.fid, updates);
+    }
+    
+    const player = await getPlayer(req.fid);
+    res.json({ player, merged: Object.keys(updates) });
+  } catch (err) {
+    console.error('Sync state error:', err);
+    res.status(500).json({ error: 'Sync failed' });
   }
-
-  const prices = getPrices();
-  const tokenAmount = Math.floor(goldAmount / prices.currentPrice);
-  if (tokenAmount <= 0) {
-    return res.status(400).json({ error: 'Gold amount too low for current price' });
-  }
-
-  const result = processGoldClaim(req.fid, goldAmount, prices.currentPrice);
-  if (!result) {
-    return res.status(400).json({ error: 'Conversion failed' });
-  }
-
-  // Update economy state
-  updateGoldSupply(-goldAmount); // gold leaves circulation
-  incrementRecentClaims();
-  recordPricePoint(prices.currentPrice);
-
-  const stats = getDailyStats(req.fid);
-  res.json({
-    success: true,
-    claimId: result.claimId,
-    goldSpent: result.goldSpent,
-    tokensClaimed: result.tokensClaimed,
-    currentPrice: prices.currentPrice,
-    priceBreakdown: `1 $FARBORN = ${prices.currentPrice} gold`,
-    dailyStats: stats
-  });
 });
 
-// ─── Gold Sinks ─────────────────────────────────────────
-app.post('/api/sink', requireAuth, (req, res) => {
+// ─── Sync: Batch Events (Validated) ────────────────────────
+app.post('/api/sync/events', requireAuth, async (req, res) => {
+  try {
+    const { events } = req.body;
+    if (!Array.isArray(events) || events.length === 0) {
+      return res.status(400).json({ error: 'No events provided' });
+    }
+    
+    const synced = [];
+    const rejected = [];
+    const player = await getPlayer(req.fid);
+    if (!player) return res.status(404).json({ error: 'Player not found' });
+    
+    // Parse JSON fields
+    let bag = typeof player.bag === 'string' ? JSON.parse(player.bag) : (player.bag || []);
+    let equipped = typeof player.equipped === 'string' ? JSON.parse(player.equipped) : (player.equipped || {});
+    
+    // Process each event with validation
+    for (const event of events) {
+      try {
+        const { type, data, ts } = event;
+        let valid = false;
+        let reason = '';
+        
+        switch (type) {
+          case 'item_drop': {
+            // Validate: check monster level vs player level
+            const validation = validateItemDrop(player, data.monsterLevel || player.level);
+            if (!validation.valid) {
+              reason = validation.reason;
+              break;
+            }
+            
+            // Generate loot server-side
+            const item = data.item || generateLoot(player.level, player.class);
+            const applyResult = applyItemDrop(player, item);
+            bag = applyResult.bag;
+            valid = true;
+            break;
+          }
+          
+          case 'item_equip': {
+            const validation = validateEquip(player, data.itemId);
+            if (!validation.valid) {
+              reason = validation.reason;
+              break;
+            }
+            
+            const applyResult = applyEquip(player, data.itemId, bag, equipped);
+            bag = applyResult.bag;
+            equipped = applyResult.equipped;
+            valid = true;
+            break;
+          }
+          
+          case 'item_unequip': {
+            const validation = validateUnequip(player, data.itemId);
+            if (!validation.valid) {
+              reason = validation.reason;
+              break;
+            }
+            
+            const applyResult = applyUnequip(player, data.itemId, bag, equipped);
+            bag = applyResult.bag;
+            equipped = applyResult.equipped;
+            valid = true;
+            break;
+          }
+          
+          case 'item_sell': {
+            const validation = validateSell(player, data.itemId);
+            if (!validation.valid) {
+              reason = validation.reason;
+              break;
+            }
+            
+            const item = bag.find(i => i.id === data.itemId);
+            const sellPrice = calculateSellPrice(item);
+            const applyResult = applySell(player, data.itemId, bag, sellPrice);
+            bag = applyResult.bag;
+            player.gold = (player.gold || 0) + sellPrice;
+            valid = true;
+            break;
+          }
+          
+          case 'forge_upgrade': {
+            const validation = validateForge(player, data.itemId);
+            if (!validation.valid) {
+              reason = validation.reason;
+              break;
+            }
+            
+            const applyResult = applyForge(player, data.itemId, bag, equipped);
+            bag = applyResult.bag;
+            equipped = applyResult.equipped;
+            player.gold = (player.gold || 0) - (applyResult.goldSpent || 0);
+            valid = true;
+            break;
+          }
+          
+          case 'level_up': {
+            const newLevel = (player.level || 1) + 1;
+            const validation = validateLevelUp(player, newLevel);
+            if (!validation.valid) {
+              reason = validation.reason;
+              break;
+            }
+            
+            const applyResult = applyLevelUp(player);
+            Object.assign(player, applyResult);
+            valid = true;
+            break;
+          }
+          
+          case 'zone_change': {
+            const validation = validateZoneChange(player, data.zone);
+            if (!validation.valid) {
+              reason = validation.reason;
+              break;
+            }
+            
+            const applyResult = applyZoneChange(player, data.zone);
+            Object.assign(player, applyResult);
+            valid = true;
+            break;
+          }
+          
+          case 'gold_spend': {
+            const validation = validateGoldSpend(player, data.amount);
+            if (!validation.valid) {
+              reason = validation.reason;
+              break;
+            }
+            
+            const applyResult = applyGoldSpend(player, data.amount);
+            Object.assign(player, applyResult);
+            valid = true;
+            break;
+          }
+          
+          case 'stat_upgrade':
+          case 'skill_use':
+          case 'prestige':
+          case 'full_state':
+            // These are handled by full state sync
+            valid = true;
+            break;
+          
+          default:
+            reason = 'Unknown event type';
+        }
+        
+        if (valid) {
+          synced.push({ id: event.id, type });
+        } else {
+          rejected.push({ id: event.id, type, reason });
+        }
+      } catch (err) {
+        console.error(`Failed to process event ${event.id}:`, err);
+        rejected.push({ id: event.id, type: event.type, reason: err.message });
+      }
+    }
+    
+    // Save updated state
+    if (synced.length > 0) {
+      await updatePlayer(req.fid, {
+        level: player.level,
+        exp: player.exp,
+        gold: player.gold,
+        zone: player.zone,
+        equipped: JSON.stringify(equipped),
+        bag: JSON.stringify(bag),
+        totalKills: player.totalKills,
+        zoneKills: player.zoneKills
+      });
+    }
+    
+    res.json({ synced, rejected, count: synced.length });
+  } catch (err) {
+    console.error('Sync events error:', err);
+    res.status(500).json({ error: 'Sync failed' });
+  }
+});
+
+// ─── Pricing ─────────────────────────────────────────────
+app.get('/api/prices', async (req, res) => {
+  res.json(await getPrices());
+});
+
+app.get('/api/economy', async (req, res) => {
+  res.json(await getEconomyDashboard());
+});
+
+app.get('/api/economy/inflation', async (req, res) => {
+  res.json(await getInflationMetrics());
+});
+
+// ─── Gold → Token conversion ─────────────────────────────
+app.post('/api/convert', requireAuth, async (req, res) => {
+  try {
+    const { goldAmount, level } = req.body;
+    const validation = await validateGoldClaim(req.fid, goldAmount, level);
+    if (!validation.valid) return res.status(400).json({ error: validation.error });
+
+    const prices = await getPrices();
+    const tokenAmount = Math.floor(goldAmount / prices.currentPrice);
+    if (tokenAmount <= 0) return res.status(400).json({ error: 'Gold amount too low' });
+
+    const result = await processGoldClaim(req.fid, goldAmount, prices.currentPrice);
+    if (!result) return res.status(400).json({ error: 'Conversion failed' });
+
+    await updateGoldSupply(-goldAmount);
+    await incrementRecentClaims();
+    await recordPricePoint(prices.currentPrice);
+
+    const stats = await getDailyStats(req.fid);
+    res.json({
+      success: true,
+      claimId: result.claimId,
+      goldSpent: result.goldSpent,
+      tokensClaimed: result.tokensClaimed,
+      currentPrice: prices.currentPrice,
+      priceBreakdown: `1 $FARBORN = ${prices.currentPrice} gold`,
+      dailyStats: stats
+    });
+  } catch (err) {
+    console.error('Convert error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ─── Gold Sinks ──────────────────────────────────────────
+app.post('/api/sink', requireAuth, async (req, res) => {
   const { type, context } = req.body;
-  const result = applyGoldSink(type, req.fid, context || {});
+  const result = await applyGoldSink(type, req.fid, context || {});
   res.json(result);
 });
 
@@ -131,112 +431,118 @@ app.get('/api/sinks', (req, res) => {
   res.json({ sinks: Object.entries(GOLD_SINKS).map(([k, v]) => ({ id: k, ...v })) });
 });
 
-// ─── Marketplace ────────────────────────────────────────
-app.get('/api/marketplace', requireAuth, (req, res) => {
-  const listings = db.prepare(`
-    SELECT ml.*, p.username as seller_name
-    FROM marketplace_listings ml
-    JOIN players p ON ml.seller_fid = p.fid
-    WHERE ml.status = 'active'
-    ORDER BY ml.created_at DESC
-    LIMIT 100
-  `).all();
+// ─── Marketplace ─────────────────────────────────────────
+app.get('/api/marketplace', requireAuth, async (req, res) => {
+  const listings = await getAll("SELECT ml.*, p.username as seller_name FROM marketplace_listings ml JOIN players p ON ml.seller_fid = p.fid WHERE ml.status = 'active' ORDER BY ml.created_at DESC LIMIT 100");
   res.json({ listings });
 });
 
-app.post('/api/marketplace/list', requireAuth, (req, res) => {
+app.post('/api/marketplace/list', requireAuth, async (req, res) => {
   const { itemId, price } = req.body;
+  if (!itemId || !price) return res.status(400).json({ error: 'Missing itemId or price' });
+  if (price < 100_000) return res.status(400).json({ error: 'Minimum price is 0.1 USDC' });
 
-  if (!itemId || !price) {
-    return res.status(400).json({ error: 'Missing itemId or price' });
-  }
-
-  if (price < 100_000) { // 0.1 USDC
-    return res.status(400).json({ error: 'Minimum price is 0.1 USDC' });
-  }
-
-  // Verify player owns the item
-  const player = getPlayer(req.fid);
+  const player = await getPlayer(req.fid);
   const itemInBag = player.bag.some(i => i.id === itemId);
   const itemEquipped = Object.values(player.equipped).some(e => e && e.id === itemId);
+  if (!itemInBag && !itemEquipped) return res.status(400).json({ error: 'You do not own this item' });
 
-  if (!itemInBag && !itemEquipped) {
-    logCheatEvent(req.fid, 'list_no_ownership', { itemId });
-    return res.status(400).json({ error: 'You do not own this item' });
-  }
-
-  // Remove from bag/equipped
   if (itemInBag) {
     const newBag = player.bag.filter(i => i.id !== itemId);
-    updatePlayer(req.fid, { bag: newBag });
+    await updatePlayer(req.fid, { bag: newBag });
   }
 
-  // Log listing (on-chain tx will be signed client-side)
-  db.prepare(`
-    INSERT INTO marketplace_listings (listing_id, seller_fid, item_id, price)
-    VALUES (?, ?, ?, ?)
-  `).run(-1, req.fid, itemId, price); // -1 until on-chain confirmed
-
-  res.json({ success: true, message: 'Listing created. Sign transaction in wallet.' });
+  await run('INSERT INTO marketplace_listings (listing_id, seller_fid, item_id, price) VALUES (?, ?, ?, ?)', [-1, req.fid, itemId, price]);
+  res.json({ success: true, message: 'Listing created' });
 });
 
-app.post('/api/marketplace/confirm', requireAuth, (req, res) => {
-  const { itemId, listingId, buyerFid } = req.body;
-
-  // Transfer item to buyer
-  const buyer = getPlayer(buyerFid);
+app.post('/api/marketplace/confirm', requireAuth, async (req, res) => {
+  const { itemId, buyerFid } = req.body;
+  const buyer = await getPlayer(buyerFid);
   if (!buyer) return res.status(404).json({ error: 'Buyer not found' });
-
-  buyer.bag.push({ id: itemId }); // simplified — in reality, full item data needed
-  updatePlayer(buyerFid, { bag: buyer.bag });
-
-  // Update listing status
-  db.prepare(`
-    UPDATE marketplace_listings SET status = 'sold', buyer_fid = ?, sold_at = datetime('now')
-    WHERE item_id = ?
-  `).run(buyerFid, itemId);
-
+  buyer.bag.push({ id: itemId });
+  await updatePlayer(buyerFid, { bag: buyer.bag });
+  await run("UPDATE marketplace_listings SET status = 'sold', buyer_fid = ?, sold_at = datetime('now') WHERE item_id = ?", [buyerFid, itemId]);
   res.json({ success: true });
 });
 
-// ─── Stats ──────────────────────────────────────────────
-app.get('/api/stats', (req, res) => {
-  const players = db.prepare('SELECT COUNT(*) as count FROM players').get();
-  const claims = db.prepare('SELECT COUNT(*) as count, SUM(tokens_claimed) as total FROM gold_claims').get();
-  const listings = db.prepare('SELECT COUNT(*) as count FROM marketplace_listings WHERE status = \'active\'').get();
+// ─── Leaderboard ────────────────────────────────────────
+app.get('/api/leaderboard/:type', async (req, res) => {
+  try {
+    const { type } = req.params;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
 
+    if (type === 'gold') {
+      const rows = await getAll(
+        'SELECT fid, username, hero_name, class, level, gold, total_gold_earned FROM players ORDER BY gold DESC LIMIT ?',
+        [limit]
+      );
+      return res.json({ type: 'gold', entries: rows.map((r, i) => ({ rank: i + 1, ...r })) });
+    }
+
+    if (type === 'level') {
+      const rows = await getAll(
+        'SELECT fid, username, hero_name, class, level, gold FROM players ORDER BY level DESC, total_gold_earned DESC LIMIT ?',
+        [limit]
+      );
+      return res.json({ type: 'level', entries: rows.map((r, i) => ({ rank: i + 1, ...r })) });
+    }
+
+    if (type === 'power') {
+      // Power = level * 100 + equipped item stats
+      const rows = await getAll(
+        'SELECT fid, username, hero_name, class, level, gold, equipped FROM players ORDER BY level DESC LIMIT ?',
+        [limit * 3] // fetch more to sort by power
+      );
+      const ranked = rows.map(r => {
+        let eqPower = 0;
+        try {
+          const eq = JSON.parse(r.equipped || '{}');
+          for (const item of Object.values(eq)) {
+            if (item && typeof item === 'object') {
+              eqPower += (item.atk || 0) + (item.def || 0) + (item.hp || 0);
+            }
+          }
+        } catch {}
+        return { rank: 0, fid: r.fid, username: r.username, hero_name: r.hero_name, class: r.class, level: r.level, gold: r.gold, power: r.level * 100 + eqPower };
+      });
+      ranked.sort((a, b) => b.power - a.power);
+      return res.json({ type: 'power', entries: ranked.slice(0, limit).map((r, i) => ({ ...r, rank: i + 1 })) });
+    }
+
+    res.status(400).json({ error: 'Invalid type. Use: gold, level, power' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Stats ───────────────────────────────────────────────
+app.get('/api/stats', async (req, res) => {
+  const players = await getOne('SELECT COUNT(*) as count FROM players');
+  const claims = await getOne('SELECT COUNT(*) as count, SUM(tokens_claimed) as total FROM gold_claims');
+  const listings = await getOne("SELECT COUNT(*) as count FROM marketplace_listings WHERE status = 'active'");
   res.json({
-    totalPlayers: players.count,
-    totalClaims: claims.count,
-    totalTokensClaimed: claims.total || 0,
-    activeListings: listings.count
+    totalPlayers: players?.count || 0,
+    totalClaims: claims?.count || 0,
+    totalTokensClaimed: claims?.total || 0,
+    activeListings: listings?.count || 0
   });
 });
 
-// ─── Cheat detection endpoint (admin) ───────────────────
-app.get('/api/admin/cheats', (req, res) => {
+// ─── Admin: cheat detection ──────────────────────────────
+app.get('/api/admin/cheats', async (req, res) => {
   const adminKey = req.headers['x-admin-key'];
-  if (adminKey !== process.env.ADMIN_KEY) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-
-  const events = db.prepare(`
-    SELECT ac.*, p.username
-    FROM anti_cheat ac
-    JOIN players p ON ac.fid = p.fid
-    ORDER BY ac.created_at DESC
-    LIMIT 100
-  `).all();
-
+  if (adminKey !== process.env.ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
+  const events = await getAll('SELECT ac.*, p.username FROM anti_cheat ac JOIN players p ON ac.fid = p.fid ORDER BY ac.created_at DESC LIMIT 100');
   res.json({ events });
 });
 
-function logCheatEvent(fid, eventType, data) {
-  db.prepare(`INSERT INTO anti_cheat (fid, event_type, event_data) VALUES (?, ?, ?)`)
-    .run(fid, eventType, JSON.stringify(data));
-}
+// ─── Vercel serverless export ────────────────────────────
+export default app;
 
-app.listen(PORT, () => {
-  console.log(`🏰 Farborn Server running on port ${PORT}`);
-  console.log(`   Health: http://localhost:${PORT}/api/health`);
-});
+// Also listen for direct Node.js execution
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`🏰 Farborn Server running on port ${PORT}`);
+  });
+}
