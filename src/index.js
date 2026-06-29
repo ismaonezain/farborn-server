@@ -151,17 +151,11 @@ app.post('/api/sync/state', requireAuth, async (req, res) => {
     // EXP: take higher
     if (exp !== undefined && exp > (current.exp || 0)) updates.exp = exp;
     
-    // Equipped: server is source of truth (already synced via events)
+    // Equipped: client is source of truth (client manages equip/unequip locally)
     if (equipped) updates.equipped = equipped;
     
-    // Bag: merge items (server + local new items)
-    if (bag && current.bag) {
-      const serverItemIds = new Set(current.bag.map(i => i.id));
-      const localOnly = bag.filter(i => !serverItemIds.has(i.id));
-      if (localOnly.length > 0) {
-        updates.bag = [...current.bag, ...localOnly];
-      }
-    }
+    // Bag: client is source of truth — client manages drops/sells/equips locally
+    if (bag) updates.bag = bag;
     
     // Class
     if (heroClass) updates.class = heroClass;
