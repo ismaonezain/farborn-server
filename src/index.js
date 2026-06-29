@@ -142,8 +142,8 @@ app.post('/api/sync/state', requireAuth, async (req, res) => {
     // Level: take higher
     if (level && (!current.level || level > current.level)) updates.level = level;
     
-    // Zone: take higher
-    if (zone !== undefined && zone > (current.zone || 0)) updates.zone = zone;
+    // Zone: take the value from client (client manages zone selection locally)
+    if (zone !== undefined) updates.zone = zone;
     
     // Gold: take higher (both could earn offline)
     if (gold !== undefined && gold > (current.gold || 0)) updates.gold = gold;
