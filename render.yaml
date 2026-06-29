@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: farborn-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: ALLOWED_ORIGINS
+        value: https://farborn-client.vercel.app
+      - key: ADMIN_KEY
+        generateValue: true
+      - key: BASE_RPC_URL
+        value: https://mainnet.base.org
+      - key: FARBORN_TOKEN_ADDRESS
+        value: 0x4abD609B323ce6E7C0770E86d21E76BA00209DE2
+      - key: FARBORN_MARKETPLACE_ADDRESS
+        value: ""
+      - key: TREASURY_WALLET
+        value: ""
+    healthCheckPath: /api/health
+    autoDeploy: true
