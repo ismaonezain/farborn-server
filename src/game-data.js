@@ -101,49 +101,49 @@ export const STAT_GROWTH = {
 export const RARITY_TABLE = {
   Common: {
     multiplier: 1.0,
-    dropRate: 0.40,
+    dropRate: 0.5339,
     color: '#b0b0b0',
     glow: false
   },
   Uncommon: {
-    multiplier: 1.2,
+    multiplier: 1.3,
     dropRate: 0.25,
     color: '#1eff00',
     glow: false
   },
   Rare: {
-    multiplier: 1.5,
+    multiplier: 1.8,
     dropRate: 0.15,
     color: '#0070dd',
     glow: false
   },
   Epic: {
-    multiplier: 2.0,
-    dropRate: 0.10,
+    multiplier: 2.8,
+    dropRate: 0.05,
     color: '#a335ee',
     glow: false
   },
   Legendary: {
-    multiplier: 3.0,
-    dropRate: 0.05,
+    multiplier: 4.5,
+    dropRate: 0.01,
     color: '#ff8000',
     glow: true
   },
   Mythic: {
-    multiplier: 5.0,
-    dropRate: 0.03,
+    multiplier: 7.0,
+    dropRate: 0.005,
     color: '#e6cc80',
     glow: true
   },
   Divine: {
-    multiplier: 8.0,
-    dropRate: 0.018,
+    multiplier: 11.0,
+    dropRate: 0.001,
     color: '#ff0000',
     glow: true
   },
   Archgod: {
     multiplier: 18.0,
-    dropRate: 0.002,
+    dropRate: 0.0001,
     color: '#ffffff',
     glow: true
   }
