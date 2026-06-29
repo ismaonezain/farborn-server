@@ -207,6 +207,7 @@ async function getPlayer(fid) {
   const player = await getOne('SELECT * FROM players WHERE fid = ?', [fid]);
   if (player) {
     player.equipped = JSON.parse(player.equipped || '{}');
+    player.upg = JSON.parse(player.upg || '{}');
     player.bag = JSON.parse(player.bag || '[]');
   }
   return player;
