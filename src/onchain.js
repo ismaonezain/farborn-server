@@ -34,11 +34,11 @@ export async function sendTokens(playerWallet, tokenAmount) {
 }
 
 // Verify a token transfer TO the treasury (for token→gold)
+// Verify a token transfer TO the treasury (for token→gold)
 export async function verifyIncomingTransfer(txHash, expectedFrom) {
   if (!provider) throw new Error('Onchain not initialized');
   const receipt = await provider.getTransactionReceipt(txHash);
   if (!receipt) return { valid: false, error: 'Transaction not found' };
-
   const iface = new ethers.Interface(ERC20_ABI);
   for (const log of receipt.logs) {
     try {
@@ -54,6 +54,30 @@ export async function verifyIncomingTransfer(txHash, expectedFrom) {
     } catch {}
   }
   return { valid: false, error: 'No valid FARBORN transfer to treasury found' };
+}
+
+// Verify ETH transfer to treasury (for gas top-up)
+export async function verifyEthTransfer(txHash, expectedFrom, minEthWei) {
+  if (!provider) throw new Error('Onchain not initialized');
+  const receipt = await provider.getTransactionReceipt(txHash);
+  if (!receipt) return { valid: false, error: 'Transaction not found' };
+  
+  // Get the transaction
+  const tx = await provider.getTransaction(txHash);
+  if (!tx) return { valid: false, error: 'Transaction data not found' };
+  
+  // Verify: from, to, and value
+  if (tx.from.toLowerCase() !== expectedFrom.toLowerCase()) {
+    return { valid: false, error: 'Sender mismatch' };
+  }
+  if (tx.to.toLowerCase() !== TREASURY.toLowerCase()) {
+    return { valid: false, error: 'Not sent to treasury' };
+  }
+  if (tx.value < BigInt(minEthWei)) {
+    return { valid: false, error: 'Insufficient ETH sent' };
+  }
+  
+  return { valid: true, amount: Number(ethers.formatEther(tx.value)) };
 }
 
 export async function getTreasuryBalance() {

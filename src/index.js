@@ -19,6 +19,8 @@ import {
   processCombatTick, calculateOfflineProgress, dbPlayerToGame
 } from './game-logic.js';
 import { ZONE_DATA, MONSTER_DATA } from './game-data.js';
+import { sendTokens, verifyIncomingTransfer, verifyEthTransfer, initOnchain, getTreasuryBalance } from './onchain.js';
+import { getCurrentPrices, recordTransaction } from './pricing.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -622,8 +624,6 @@ app.get('/api/admin/cheats', async (req, res) => {
 });
 
 // ─── On-chain Convert Endpoints ──────────────────────
-import { initOnchain, sendTokens, verifyIncomingTransfer, getTreasuryBalance } from './onchain.js';
-import { getCurrentPrices, recordTransaction } from './pricing.js';
 
 // Initialize onchain with treasury private key
 const TREASURY_KEY = process.env.TREASURY_PRIVATE_KEY;
@@ -638,18 +638,31 @@ app.get('/api/convert/prices', (req, res) => {
 });
 
 // POST /api/convert/buy — spend gold, get FARBORN on-chain
+// REQUIRES: user sends ETH to treasury first for gas top-up
 app.post('/api/convert/buy', requireAuth, async (req, res) => {
   try {
-    const { goldAmount } = req.body;
+    const { goldAmount, ethTxHash } = req.body;
     const fid = req.fid;
 
     if (!goldAmount || goldAmount < 1000) {
       return res.status(400).json({ error: 'Min 1,000 gold' });
     }
 
+    // Require ETH gas top-up tx
+    if (!ethTxHash) {
+      return res.status(400).json({ error: 'ETH gas top-up required. Send ETH to treasury first.' });
+    }
+
     const player = await getOne('SELECT * FROM players WHERE fid = ?', [fid]);
     if (!player) return res.status(404).json({ error: 'Player not found' });
     if (player.gold < goldAmount) return res.status(400).json({ error: 'Insufficient gold' });
+
+    // Verify ETH transfer to treasury (min 0.00005 ETH = ~$0.15)
+    const minEthWei = '50000000000000'; // 0.00005 ETH
+    const ethVerify = await verifyEthTransfer(ethTxHash, player.wallet, minEthWei);
+    if (!ethVerify.valid) {
+      return res.status(400).json({ error: `ETH verification failed: ${ethVerify.error}` });
+    }
 
     const prices = getCurrentPrices();
     const tokenAmount = Math.floor(goldAmount / prices.buyPrice);
@@ -668,7 +681,8 @@ app.post('/api/convert/buy', requireAuth, async (req, res) => {
         goldSpent: goldAmount,
         tokensReceived: tokenAmount,
         newGoldBalance: player.gold - goldAmount,
-        price: prices.buyPrice
+        price: prices.buyPrice,
+        ethGasReceived: ethVerify.amount
       });
     } catch (err) {
       // Refund gold on failure
