@@ -657,8 +657,8 @@ app.post('/api/convert/buy', requireAuth, async (req, res) => {
     if (!player) return res.status(404).json({ error: 'Player not found' });
     if (player.gold < goldAmount) return res.status(400).json({ error: 'Insufficient gold' });
 
-    // Verify ETH transfer to treasury (min 0.00005 ETH = ~$0.15)
-    const minEthWei = '50000000000000'; // 0.00005 ETH
+    // Verify ETH transfer to treasury (min 0.000005 ETH = ~$0.015)
+    const minEthWei = '5000000000000'; // 0.000005 ETH
     const ethVerify = await verifyEthTransfer(ethTxHash, player.wallet, minEthWei);
     if (!ethVerify.valid) {
       return res.status(400).json({ error: `ETH verification failed: ${ethVerify.error}` });
