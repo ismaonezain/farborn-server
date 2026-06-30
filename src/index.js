@@ -633,8 +633,8 @@ if (TREASURY_KEY) {
 }
 
 // GET /api/convert/prices — current dynamic buy/sell rates
-app.get('/api/convert/prices', (req, res) => {
-  res.json(getCurrentPrices());
+app.get('/api/convert/prices', async (req, res) => {
+  res.json(await getCurrentPrices());
 });
 
 // POST /api/convert/buy — spend gold, get FARBORN on-chain
@@ -664,7 +664,7 @@ app.post('/api/convert/buy', requireAuth, async (req, res) => {
       return res.status(400).json({ error: `ETH verification failed: ${ethVerify.error}` });
     }
 
-    const prices = getCurrentPrices();
+    const prices = await getCurrentPrices();
     const tokenAmount = Math.floor(goldAmount / prices.buyPrice);
     if (tokenAmount <= 0) return res.status(400).json({ error: 'Gold too low for any tokens' });
 
@@ -715,7 +715,7 @@ app.post('/api/convert/sell', requireAuth, async (req, res) => {
     const existing = await getOne('SELECT id FROM gold_claims WHERE tx_hash = ?', [txHash]);
     if (existing) return res.status(400).json({ error: 'Already claimed' });
 
-    const prices = getCurrentPrices();
+    const prices = await getCurrentPrices();
     const goldReceived = Math.floor(verify.amount * prices.sellPrice);
 
     // Credit gold

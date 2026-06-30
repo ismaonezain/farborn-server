@@ -52,6 +52,14 @@ const schema = [
     sink_type TEXT NOT NULL, gold_amount INTEGER NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
   )`,
+  `CREATE TABLE IF NOT EXISTS token_prices (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    buy_price INTEGER DEFAULT 10000,
+    sell_price INTEGER DEFAULT 9000,
+    recent_buys INTEGER DEFAULT 0,
+    recent_sells INTEGER DEFAULT 0,
+    updated_at TEXT DEFAULT (datetime('now'))
+  )`,
 ];
 
 // Run schema init (non-blocking, don't crash if fails)
