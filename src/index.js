@@ -130,7 +130,7 @@ app.get('/api/sync/state', requireAuth, async (req, res) => {
 
 app.post('/api/sync/state', requireAuth, async (req, res) => {
   try {
-    const { level, zone, gold, exp, equipped, bag, class: heroClass, upg, skillIdx, totalKills, zoneKills, prestige, prestigeMult, ts } = req.body;
+    const { level, zone, gold, exp, equipped, bag, class: heroClass, upg, skillIdx, totalKills, zoneKills, prestige, prestigeMult, potions, ts } = req.body;
     
     // Get current server state
     const current = await getPlayer(req.fid);
@@ -173,6 +173,9 @@ app.post('/api/sync/state', requireAuth, async (req, res) => {
     // Prestige
     if (prestige !== undefined && prestige > (current.prestige || 0)) updates.prestige = prestige;
     if (prestigeMult !== undefined && prestigeMult > (current.prestigeMult || 1)) updates.prestigeMult = prestigeMult;
+
+    // Potions: client is source of truth
+    if (potions) updates.potions = potions;
     
     // Apply updates
     if (Object.keys(updates).length > 0) {
@@ -616,6 +619,118 @@ app.get('/api/admin/cheats', async (req, res) => {
   if (adminKey !== process.env.ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
   const events = await getAll('SELECT ac.*, p.username FROM anti_cheat ac JOIN players p ON ac.fid = p.fid ORDER BY ac.created_at DESC LIMIT 100');
   res.json({ events });
+});
+
+// ─── On-chain Convert Endpoints ──────────────────────
+import { initOnchain, sendTokens, verifyIncomingTransfer, getTreasuryBalance } from './onchain.js';
+import { getCurrentPrices, recordTransaction } from './pricing.js';
+
+// Initialize onchain with treasury private key
+const TREASURY_KEY = process.env.TREASURY_PRIVATE_KEY;
+if (TREASURY_KEY) {
+  initOnchain(TREASURY_KEY);
+  console.log('[onchain] Treasury wallet initialized');
+}
+
+// GET /api/convert/prices — current dynamic buy/sell rates
+app.get('/api/convert/prices', (req, res) => {
+  res.json(getCurrentPrices());
+});
+
+// POST /api/convert/buy — spend gold, get FARBORN on-chain
+app.post('/api/convert/buy', requireAuth, async (req, res) => {
+  try {
+    const { goldAmount } = req.body;
+    const fid = req.fid;
+
+    if (!goldAmount || goldAmount < 1000) {
+      return res.status(400).json({ error: 'Min 1,000 gold' });
+    }
+
+    const player = await getOne('SELECT * FROM players WHERE fid = ?', [fid]);
+    if (!player) return res.status(404).json({ error: 'Player not found' });
+    if (player.gold < goldAmount) return res.status(400).json({ error: 'Insufficient gold' });
+
+    const prices = getCurrentPrices();
+    const tokenAmount = Math.floor(goldAmount / prices.buyPrice);
+    if (tokenAmount <= 0) return res.status(400).json({ error: 'Gold too low for any tokens' });
+
+    // Deduct gold first
+    await run('UPDATE players SET gold = gold - ? WHERE fid = ?', [goldAmount, fid]);
+
+    try {
+      // Send tokens on-chain
+      const result = await sendTokens(player.wallet, tokenAmount);
+      recordTransaction('buy', goldAmount);
+      res.json({
+        success: true,
+        txHash: result.txHash,
+        goldSpent: goldAmount,
+        tokensReceived: tokenAmount,
+        newGoldBalance: player.gold - goldAmount,
+        price: prices.buyPrice
+      });
+    } catch (err) {
+      // Refund gold on failure
+      await run('UPDATE players SET gold = gold + ? WHERE fid = ?', [goldAmount, fid]);
+      console.error('[convert] buy transfer failed:', err.message);
+      res.status(500).json({ error: 'Transfer failed: ' + err.message });
+    }
+  } catch (err) {
+    console.error('[convert] buy error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// POST /api/convert/sell — player sends FARBORN to treasury, gets gold
+app.post('/api/convert/sell', requireAuth, async (req, res) => {
+  try {
+    const { txHash } = req.body;
+    const fid = req.fid;
+
+    if (!txHash) return res.status(400).json({ error: 'Missing tx hash' });
+
+    const player = await getOne('SELECT * FROM players WHERE fid = ?', [fid]);
+    if (!player) return res.status(404).json({ error: 'Player not found' });
+
+    // Verify on-chain
+    const verify = await verifyIncomingTransfer(txHash, player.wallet);
+    if (!verify.valid) return res.status(400).json({ error: verify.error });
+
+    // Check not already claimed
+    const existing = await getOne('SELECT id FROM gold_claims WHERE tx_hash = ?', [txHash]);
+    if (existing) return res.status(400).json({ error: 'Already claimed' });
+
+    const prices = getCurrentPrices();
+    const goldReceived = Math.floor(verify.amount * prices.sellPrice);
+
+    // Credit gold
+    await run('UPDATE players SET gold = gold + ? WHERE fid = ?', [goldReceived, fid]);
+    await run('INSERT INTO gold_claims (fid, gold_spent, tokens_claimed, tx_hash) VALUES (?, ?, ?, ?)',
+      [fid, goldReceived, verify.amount, txHash]);
+    recordTransaction('sell', verify.amount);
+
+    res.json({
+      success: true,
+      tokenAmount: verify.amount,
+      goldReceived,
+      newGoldBalance: player.gold + goldReceived,
+      price: prices.sellPrice
+    });
+  } catch (err) {
+    console.error('[convert] sell error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// GET /api/convert/treasury
+app.get('/api/convert/treasury', async (req, res) => {
+  try {
+    const info = await getTreasuryBalance();
+    res.json(info);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── Vercel serverless export ────────────────────────────

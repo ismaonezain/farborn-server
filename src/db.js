@@ -69,6 +69,7 @@ const alterStatements = [
   "ALTER TABLE players ADD COLUMN prestige INTEGER DEFAULT 0",
   "ALTER TABLE players ADD COLUMN prestigeMult REAL DEFAULT 1.0",
   "ALTER TABLE players ADD COLUMN last_online TEXT DEFAULT NULL",
+  "ALTER TABLE players ADD COLUMN potions TEXT DEFAULT '{\"small\":0,\"medium\":0,\"large\":0}'",
 ];
 
 for (const stmt of alterStatements) {

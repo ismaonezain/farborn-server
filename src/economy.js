@@ -193,9 +193,9 @@ async function updatePlayer(fid, data) {
   for (const [key, value] of Object.entries(data)) {
     if (value === undefined) continue; // skip undefined
     if (['level', 'class', 'zone', 'gold', 'equipped', 'bag', 'exp',
-         'totalKills', 'zoneKills', 'upg', 'skillIdx', 'prestige', 'prestigeMult', 'total_gold_earned', 'last_online'].includes(key)) {
+         'totalKills', 'zoneKills', 'upg', 'skillIdx', 'prestige', 'prestigeMult', 'total_gold_earned', 'last_online', 'potions'].includes(key)) {
       fields.push(key + ' = ?');
-      values.push(['equipped', 'bag', 'upg'].includes(key) ? JSON.stringify(value) : value);
+      values.push(['equipped', 'bag', 'upg', 'potions'].includes(key) ? JSON.stringify(value) : value);
     }
   }
   if (fields.length === 0) return false;
@@ -211,6 +211,7 @@ async function getPlayer(fid) {
     player.equipped = JSON.parse(player.equipped || '{}');
     player.upg = JSON.parse(player.upg || '{}');
     player.bag = JSON.parse(player.bag || '[]');
+    player.potions = JSON.parse(player.potions || '{"small":0,"medium":0,"large":0}');
   }
   return player;
 }
